@@ -1,0 +1,354 @@
+{
+    "configVersion": "1.0.0",
+    "fileName": "test_main.json",
+
+    "database": {
+        "description": "数据库配置",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "username": "root",
+        "password": "123456"
+    },
+
+    "tcpServers": {
+        "description": "TCP服务器配置，支持多个TCP服务端",
+        "main": {
+            "description": "主服务器",
+            "host": "0.0.0.0",
+            "port": 40004
+        },
+        "accessControl": {
+            "description": "门禁服务器",
+            "host": "0.0.0.0",
+            "port": 40005
+        }
+    },
+
+    "tcpConnections": {
+        "description": "TCP连接配置，支持多个目标TCP服务端连接",
+        "positionServer": {
+            "description": "定位服务器，默认自动重连",
+            "host": "192.168.110.23",
+            "port": 12345,
+            "heartbeatInterval": 5000
+        }
+    },
+
+    "mqtt": {
+        "description": "MQTT服务器配置",
+        "broker": "tcp://192.168.110.23:2882",
+        "username": "1",
+        "password": "1",
+        "clientId": "dmps_adsServer",
+        "subscriptions": {
+            "description": "要订阅的主题列表",
+            "subscribe": [
+                {
+                    "topic": "unity/pathPlanningPlatform/templates/commands",
+                    "qos": 2
+                }
+            ]
+        },
+        "publications": {
+            "description": "要发布的主题与负载列表",
+            "publish": [
+                {
+                    "topic": "unity/pathPlanningPlatform/topics",
+                    "qos": 2,
+                    "retain": true,
+                    "payload": {
+                        "unity/pathPlanningPlatform/templates": true,
+                        "qt/ADSAVICS/task/feedback": true
+                    }
+                },
+                {
+                    "topic": "qt/ADSAVICS/topics",
+                    "qos": 2,
+                    "retain": true,
+                    "payload": {
+                        "qt/ADSAVICS/task/dispatch": true
+                    }
+                },
+                {
+                    "topic": "unity/pathPlanningPlatform/templates",
+                    "qos": 2,
+                    "retain": true,
+                    "payload": {
+                        "name1": {
+                            "type": 1,
+                            "name":"自定义模板1",
+                            "roadID": 830,
+                            "dir": 0,
+                            "sideMode": 0,
+                            "headDir": 0,
+                            "speedRate": 0.1,
+                            "turnRate": 0.1,
+                            "leftWarnDis": 0.1,
+                            "leftSafeDis": 0.1,
+                            "rightWarnDis": 0.1,
+                            "rightSafeDis": 0.1,
+                            "safeDistance": 0.1,
+                            "turnDistance": 0.1,
+                            "maxLeft": 0.1,
+                            "maxRight": 0.1,
+                            "bendMindis": 0.1,
+                            "bendMaxdis": 0.1,
+                            "bendCurrent": 0.1,
+                            "bendRate": 0.1,
+                            "bendAcc": 0.35,
+                            "straightAcc": 0.25,
+                            "turnCurrent": 0.2,
+                            "brakingCoefficient":0.1
+                        },
+                        "name2": {
+                            "type": 0,
+                            "name":"预设模板",
+                            "roadID": 830,
+                            "dir": 0,
+                            "sideMode": 0,
+                            "headDir": 0,
+                            "speedRate": 0.1,
+                            "turnRate": 0.1,
+                            "leftWarnDis": 0.1,
+                            "leftSafeDis": 0.1,
+                            "rightWarnDis": 0.1,
+                            "rightSafeDis": 0.1,
+                            "safeDistance": 0.1,
+                            "turnDistance": 0.1,
+                            "maxLeft": 0.1,
+                            "maxRight": 0.1,
+                            "bendMindis": 0.1,
+                            "bendMaxdis": 0.1,
+                            "bendCurrent": 0.1,
+                            "bendRate": 0.1,
+                            "bendAcc": 0.35,
+                            "straightAcc": 0.25,
+                            "turnCurrent": 0.2,
+                            "brakingCoefficient":0.1
+                        }
+                    }
+                }
+            ]
+        }
+    },
+
+    "objects": {
+        "description": "管理对象配置，支持通过IP:Port快速查找实例， 32位转十六进制字符串，大端序",
+
+        "mappings": {
+            "description": "连接端点到实例ID的快速查找表",
+            "192.168.110.81": {
+                "0-65535": "02000000-1"
+            },
+            "192.168.110.101": {
+                "0-65535": "01000000-1"
+            },
+            "192.168.110.23": {
+                "50600-50609": "80000001-1"
+            },
+            "192.168.110.97": {
+                "0-65535": "80000001-1"
+            }
+        },
+
+        "instances": {
+            "02000000-1": {
+                "description": "无人驾驶路径规划平台",
+                "category": "02000000",
+                "uniqueCode": "pathPlanningPlatform",
+                "heartbeatInterval": 0,
+                "data": {
+                    "protocol": "JSON",
+                    "version": 1
+                },
+                "routes": {
+                    "description":"数据路由配置",
+                    "static": [
+                        {
+                            "description": "路径规划模板处理流水线",
+                            "from": "unity/pathPlanningPlatform/templates/commands",
+                            "workflows": [
+                                {
+                                    "network": "mqtt",
+                                    "protocol": "JSON",
+                                    "topic": "unity/pathPlanningPlatform/templates",
+                                    "qos": 2,
+                                    "retain": true,
+                                    "description": "发布更新后的模板"
+                                },
+                                {
+                                    "network": "mqtt",
+                                    "protocol": "JSON",
+                                    "topic": "unity/pathPlanningPlatform/templates/commands/feedback",
+                                    "qos": 2,
+                                    "retain": false,
+                                    "description": "发布命令反馈"
+                                }
+                            ]
+                        },
+                        {
+                            "description": "增加基站",
+                            "from": "3001",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "JSON",
+                                    "to": "02000000-1",
+                                    "description": ""
+                                }
+                            ]
+                        },
+                        {
+                            "description": "修改基站",
+                            "from": "3002",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "JSON",
+                                    "to": "02000000-1",
+                                    "description": ""
+                                }
+                            ]
+                        },
+                        {
+                            "description": "删除基站",
+                            "from": "3003",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "JSON",
+                                    "to": "02000000-1",
+                                    "description": ""
+                                }
+                            ]
+                        },
+                        {
+                            "description": "增加道路",
+                            "from": "4001",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "JSON",
+                                    "to": "02000000-1",
+                                    "description": ""
+                                }
+                            ]
+                        },
+                        {
+                            "description": "删除道路",
+                            "from": "4003",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "JSON",
+                                    "to": "02000000-1",
+                                    "description": ""
+                                }
+                            ]
+                        },
+                        {
+                            "description": "配置任务",
+                            "from": "5001",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "JSON",
+                                    "to": "02000000-1",
+                                    "description": ""
+                                }
+                            ]
+                        },
+                        {
+                            "description": "删除任务",
+                            "from": "5003",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "JSON",
+                                    "to": "02000000-1",
+                                    "description": ""
+                                }
+                            ]
+                        },
+                        {
+                            "description": "任务下发流水线，目前还是通过旧的JSON格式下发，来源为MsgID5004",
+                            "from": "5004",
+                            "workflows": [
+                                {
+                                    "network": "mqtt",
+                                    "protocol": "JSON",
+                                    "topic": "qt/ADSAVICS/task/dispatch",
+                                    "qos": 2,
+                                    "retain": true,
+                                    "description": "将路径规划生成的任务下发给无人驾驶系统"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            "01000000-1": {
+                "description": "无人驾驶系统",
+                "category": "01000000",
+                "uniqueCode": "ADSAVICS",
+                "heartbeatInterval": 2000,
+                "data": {
+                    "protocol": "CAN",
+                    "version": 1
+                },
+                "routes": {
+                    "description":"数据路由配置",
+                    "static": [
+                        {
+                            "description": "无人驾驶系统数据处理流水线",
+                            "from": "01000000-1",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "CAN",
+                                    "to": "80000001-1",
+                                    "description": "将接收到的数据处理后发送到80000001-1"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+            "80000001-1": {
+                "description": "铲运机操作台",
+                "category": "80000001",
+                "uniqueCode": "LHD_Control_Console_1",
+                "heartbeatInterval": 2000,
+                "data": {
+                    "protocol": "CAN",
+                    "version": 1
+                },
+                "routes": {
+                    "description":"数据路由配置",
+                    "static": [
+                        {
+                            "description": "铲运机操作台数据处理流水线1",
+                            "from": "80000001-1",
+                            "workflows": [
+                                {
+                                    "network": "tcp",
+                                    "protocol": "CAN",
+                                    "to": "01000000-1",
+                                    "description": "将接收到的数据处理后发送到01000000-1"
+                                },
+                                {
+                                    "network": "mqtt",
+                                    "protocol": "JSON",
+                                    "topic": "qt/ADSAVICS/data",
+                                    "qos": 0,
+                                    "retain": false,
+                                    "description": "将接收到的数据发布到MQTT主题qt/ADSAVICS/data"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+    }
+}
