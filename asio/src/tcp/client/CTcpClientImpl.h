@@ -1,7 +1,7 @@
 #pragma once
 
+#include "Defs.h"
 #include "tcp/CTcpClient.h"
-#include "tcp/client/CReconnectController.h"
 
 #include <boost/asio.hpp>
 #include <boost/asio/strand.hpp>
@@ -15,251 +15,203 @@ constexpr auto MAX_READ_LENGTH = 4096;
 
 namespace asio {
 
+/**
+ * @brief 客户端连接生命周期状态枚举（State 模式）。
+ *
+ * @details 用单一原子枚举替代原先的 bool 组合，使状态转换在源码中可读且可强制校验。
+ *
+ * 合法转换路径：
+ * @code
+ *   Disconnected ──doConnect()──> Connecting ──onConnect() ok──> Connected
+ *        ^                                                          |
+ *        └─────────────── doDisconnect() / 连接失败 ─────────────────┘
+ * @endcode
+ */
+enum class ClientState : uint8_t {
+    Disconnected = 0, ///< 未连接，可发起 doConnect()
+    Connecting = 1,   ///< 异步连接进行中，禁止重复连接
+    Connected = 2     ///< 连接就绪，可收发数据
+};
+
+/**
+ * @brief CTcpClient 的内部实现类（Pimpl 惯用法）。
+ *
+ * @details 将网络 I/O、重连策略、发送队列等细节完全隐藏在此类中，
+ *          对外只通过 CTcpClient 公共接口暴露行为。
+ *
+ * 设计要点：
+ * - IO 线程与 Task 线程分离，用户回调不占用 IO 线程。
+ * - Strand 串行化所有 socket 操作，无需显式加锁。
+ * - 指数退避自动重连，最大延迟 30s。
+ * - 无锁发送队列（moodycamel::ConcurrentQueue）+ 批量 scatter-gather 写。
+ *
+ * @see CTcpClient
+ */
 class CTcpClient::Impl : public std::enable_shared_from_this<CTcpClient::Impl>
 {
-public:
-    /**
-     * @brief 构造并初始化基础执行器对象。
-     * @details 仅完成对象级初始化，不启动线程，不建立连接。
-     * @note 构造完成后需先调用 init()，再调用 connect()。
-     */
-    Impl();
-
-    /**
-     * @brief 析构时确保资源回收。
-     * @details 调用 stop() 关闭 socket、停止 io_context 并回收线程。
-     */
-    ~Impl();
-
-public:
-    /**
-     * @brief 初始化客户端运行时资源。
-     * @return 初始化成功返回 true，否则返回 false。
-     */
-    bool init() noexcept;
-
-    /**
-     * @brief 发起到目标地址的异步连接流程。
-     * @param serverAddr 服务端地址。
-     * @return 连接流程成功启动返回 true，否则返回 false。
-     */
-    bool connect(const NetAddr& serverAddr) noexcept;
-
-    /**
-     * @brief 主动断开连接并停止重连。
-     */
-    void disconnect() noexcept;
-
-    /**
-     * @brief 将消息加入发送队列并触发写循环。
-     * @param data 待发送数据。
-     * @return 入队成功返回 true，否则返回 false。
-     */
-    bool send(std::string_view data) noexcept;
-
-    /**
-     * @brief 设置客户端回调（拷贝）。
-     */
-    void setCallback(const ClientCallback& callback) noexcept;
-
-    /**
-     * @brief 设置客户端回调（移动）。
-     */
-    void setCallback(ClientCallback&& callback) noexcept;
-
-private:
-    using tcp = boost::asio::ip::tcp;
+    ///< Socket 相关操作执行器，保证连接/读写状态机串行推进
     using Strand = boost::asio::strand<boost::asio::io_context::executor_type>;
     using WorkGuard = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
     using WorkGuardPtr = std::unique_ptr<WorkGuard>;
     using Threads = std::vector<std::thread>;
 
+public:
     /**
-     * @brief 客户端生命周期状态。
+     * @brief 构造并初始化基础执行器对象。
+     * @note 仅完成对象级初始化，不启动线程，不建立连接。
+     *       构造完成后需先调用 init()，再调用 connect()。
      */
-    enum class LifecycleState : uint8_t {
-        Created = 0,  // 对象已创建但未初始化
-        Running = 1,  // 客户端已初始化并可正常使用
-        Stopping = 2, // 客户端正在停止中，等待相关回调完成后进入 Stopped
-        Stopped = 3,  // 客户端已完全停止，禁止一切操作
-    };
+    Impl();
 
     /**
-     * @brief 连接状态机状态。
+     * @brief 析构时确保资源回收。
+     * @details 关闭 socket、停止 io_context 并 join 所有线程。
+     * @note 幂等：若未初始化则直接返回。
      */
-    enum class ConnectionState : uint8_t {
-        Idle = 0,          // 未连接，或连接已断开且不打算重连
-        Connecting = 1,    // 连接中，尚未完成三次握手
-        Connected = 2,     // 连接已完成，读写循环正常运行
-        Reconnecting = 3,  // 连接已断开，正在等待重连时机或重连中
-        Disconnecting = 4, // 连接正在断开中，等待相关回调完成后进入 Idle 或 Reconnecting
-        Stopped = 5,       // 客户端已停止，禁止一切网络操作
-    };
+    ~Impl();
+
+public:
+    /**
+     * @brief 初始化客户端运行时资源（State: 未初始化 → 已初始化）。
+     * @return 成功返回 true；若已初始化或资源分配失败则返回 false。
+     * @note 失败时 RAII Guard 保证 m_initialized 回滚为 false。
+     */
+    bool init() noexcept;
 
     /**
-     * @brief 断链后的状态收敛模式。
+     * @brief 发起到目标地址的异步连接流程。
+     * @param[in] serverAddr 服务端地址。
+     * @return 连接任务投递成功返回 true；未初始化返回 false。
+     * @note 调用前会先执行 disconnect() 确保旧连接已清理。
+     * @warning 必须先调用 init() 成功后才可调用 connect()。
      */
-    enum class DisconnectMode : uint8_t {
-        KeepIdle = 0,           // 断开后保持空闲状态
-        ReconnectIfEnabled = 1, // 断开后如果启用重连则尝试重连
-    };
+    bool connect(const NetAddr& serverAddr) noexcept;
 
     /**
-     * @brief Socket 关闭执行模式。
+     * @brief 主动断开连接并取消自动重连。
+     * @note 幂等：未初始化或已断开时静默返回。
      */
-    enum class SocketCloseMode : uint8_t {
-        Immediate = 0,     // 立即在当前线程关闭 socket，可能在读写回调中执行
-        OnWriteStrand = 1, // 在写执行器中关闭 socket，保证与写循环不并发执行
-    };
+    void disconnect() noexcept;
+
+    /**
+     * @brief 将消息入队并触发异步写循环。
+     * @param[in] data 待发送数据视图。
+     * @return 成功入队返回 true；未初始化、未连接或数据为空返回 false。
+     */
+    bool send(std::string_view data) noexcept;
+
+    /**
+     * @brief 设置应用层事件回调（拷贝语义）。
+     * @param[in] callback 回调结构体。
+     * @note 投递到任务线程执行，线程安全。
+     */
+    void setCallback(const ClientCallback& callback) noexcept;
+
+    /**
+     * @brief 设置应用层事件回调（移动语义）。
+     * @param[in] callback 右值引用，调用后原对象处于有效但未指定状态。
+     */
+    void setCallback(ClientCallback&& callback) noexcept;
 
 private:
-    /** @brief 网络 IO 事件循环。 */
-    boost::asio::io_context m_ioContext;
+    /// @brief 在 IO strand 中发起异步连接。
+    void doConnect() noexcept;
 
-    /** @brief 业务回调事件循环。 */
-    boost::asio::io_context m_taskContext;
+    /// @brief async_connect 完成回调，成功则启动读循环，失败则触发重连。
+    void onConnect(const boost::system::error_code& ec) noexcept;
 
-    /** @brief TCP 套接字，仅应在写执行器序列中执行关闭/重建。 */
-    tcp::socket m_socket;
+    /**
+     * @brief 断开 socket 并按需触发重连定时器。
+     * @param[in] isReTry 为 true 时启动指数退避重连；主动断开时传 false。
+     */
+    void doDisconnect(bool isReTry = true) noexcept;
 
-    /** @brief 读侧串行执行器，保证读回调顺序一致。 */
-    Strand m_readStrand;
+    /// @brief 在 IO strand 中投递下一轮 async_read_some。
+    void doRead() noexcept;
 
-    /** @brief 写侧串行执行器，保证连接/写入状态机串行推进。 */
-    Strand m_writeStrand;
+    /// @brief async_read_some 完成回调。
+    void onRead(const boost::system::error_code& ec, size_t len) noexcept;
 
-    /** @brief 读缓冲区，承接 async_read_some 数据。 */
-    std::array<char, MAX_READ_LENGTH> m_readBuffer;
+    /// @brief 批量出队并发起 async_write（scatter-gather）。
+    void doWrite() noexcept;
 
-    /** @brief 写批次字符串存储，拥有发送数据生命周期。 */
-    std::vector<std::string> m_batchMessages;
-
-    /** @brief 发送缓冲视图，元素引用 m_batchMessages 内存。 */
-    std::vector<boost::asio::const_buffer> m_batchViews;
-
-    /** @brief 无锁发送队列，生产者为 send()，消费者为 startWriteLoop()。 */
-    moodycamel::ConcurrentQueue<std::string> m_sendQueue;
-
-    /** @brief IO 线程集合。 */
-    Threads m_ioThreads;
-
-    /** @brief 回调任务线程集合。 */
-    Threads m_taskThreads;
-
-    /** @brief 防止 m_ioContext 在无任务时提前退出。 */
-    WorkGuardPtr m_ioWorkGuard;
-
-    /** @brief 防止 m_taskContext 在无任务时提前退出。 */
-    WorkGuardPtr m_taskWorkGuard;
-
-    /** @brief IO 线程数配置值。 */
-    size_t m_ioThreadCount = 0;
-
-    /** @brief 回调线程数配置值。 */
-    size_t m_taskThreadCount = 0;
-
-    /** @brief 客户端生命周期状态（枚举化状态）。 */
-    std::atomic<LifecycleState> m_lifecycleState{LifecycleState::Created};
-
-    /** @brief 连接状态（枚举化状态）。 */
-    std::atomic<ConnectionState> m_connectionState{ConnectionState::Idle};
-
-    /** @brief 写泵是否正在运行。 */
-    std::atomic_bool m_writePumpRunning{false};
-
-    /** @brief 当前连接目标地址。 */
-    NetAddr m_connectTarget;
-
-    /** @brief 自动重连控制器。 */
-    CReconnectController m_reconnectController;
-
-    /** @brief 用户回调集合，所有调用均投递到 taskContext。 */
-    ClientCallback m_callback;
+    /// @brief async_write 完成回调，继续写循环或清除飞行标志。
+    void onWrite(const boost::system::error_code& ec, size_t len) noexcept;
 
 private:
-    // 核心异步操作
-
     /**
-     * @brief 启动一次连接尝试。
-     * @details 该方法在写执行器上下文中运行。
+     * @name 事件上报（Command 模式）
+     * @brief 所有用户回调均通过 postTask 投递到任务线程执行，不占用 IO 线程。
+     * @{
      */
-    void beginConnect() noexcept;
-
-    /**
-     * @brief 连接完成回调。
-     * @param ec 连接结果错误码。
-     */
-    void onConnectResult(boost::system::error_code ec) noexcept;
-
-    /**
-     * @brief 启动异步读循环。
-     */
-    void startReadLoop() noexcept;
-
-    /**
-     * @brief 启动或续跑写循环。
-     */
-    void startWriteLoop() noexcept;
-
-    /**
-     * @brief 停止客户端并回收线程资源。
-     */
-    void stop() noexcept;
-
-    // 回调报告
     void reportConnected() noexcept;
     void reportDisconnected() noexcept;
     void reportMessageReceived(const char* data, size_t length) noexcept;
     void reportError(const std::string& msg) noexcept;
+    /** @} */
 
-    // 线程投递辅助
-    void postWrite(std::function<void(Impl&)> task) noexcept;
+    /**
+     * @brief 向 IO strand 投递任务（在 IO 线程串行执行）。
+     * @param[in] task 签名为 void(Impl&) 的可调用对象。
+     */
+    void postIo(std::function<void(Impl&)> task) noexcept;
+
+    /**
+     * @brief 向 Task strand 投递任务（在任务线程串行执行）。
+     * @param[in] task 签名为 void(Impl&) 的可调用对象。
+     */
     void postTask(std::function<void(Impl&)> task) noexcept;
 
-    // 写流程辅助
-
     /**
-     * @brief 尝试启动写循环闸门。
-     * @return 成功抢占返回 true。
+     * @brief Template Method：线程池统一启动模板。
+     *
+     * @details 封装 "创建 work_guard → reserve → 批量 emplace 线程" 固定序列，
+     *          init() 通过参数区分 IO 池和 Task 池，无重复代码。
+     *
+     * @param[in]  threadCount 线程数量。
+     * @param[in]  context     目标 io_context 引用。
+     * @param[out] workGuard   输出 work_guard，防止 context 自然退出。
+     * @param[out] threads     输出已启动的线程集合。
+     * @return 启动成功返回 true；任意步骤失败则调用 reportError() 并返回 false。
      */
-    bool tryStartWritePump() noexcept;
-
-    /**
-     * @brief 从队列批量提取发送数据。
-     */
-    bool dequeueWriteBatch(size_t& count) noexcept;
-
-    /**
-     * @brief 清理写循环占用标记。
-     */
-    void finishWritePump() noexcept;
-
-    // 连接状态辅助
-
-    /**
-     * @brief 统一处理断链路径。
-     * @param mode 断链后的收敛模式。
-     * @param closeMode socket 关闭执行模式。
-     */
-    void processDisconnect(DisconnectMode mode, SocketCloseMode closeMode) noexcept;
-
-    /**
-     * @brief 安排一次重连尝试。
-     * @details 该方法会在写执行器中回到 beginConnect()。
-     */
-    void scheduleReconnectAttempt() noexcept;
-
-    /**
-     * @brief 立即关闭 socket。
-     */
-    void closeSocketNow() noexcept;
+    bool initializeContext(size_t threadCount,
+                           boost::asio::io_context& context,
+                           WorkGuardPtr& workGuard,
+                           Threads& threads) noexcept;
 
 private:
-    // 线程初始化辅助
-    bool initThreads(size_t threadCount,
-                     boost::asio::io_context& context,
-                     WorkGuardPtr& workGuard,
-                     Threads& threads) noexcept;
+    std::atomic<bool> m_initialized{false}; ///< 初始化标志，确保 init() 只能成功调用一次
+
+    /// @name IO 线程池——驱动 asio 网络事件
+    /// @{
+    boost::asio::io_context m_ioContext;
+    boost::asio::ip::tcp::socket m_socket;
+    boost::asio::steady_timer m_reconnectTimer; ///< 指数退避重连定时器
+    WorkGuardPtr m_ioWorkGuard;
+    Threads m_ioThreads;
+    Strand m_ioStrand; ///< 串行化 connect/read/write/disconnect
+    std::array<char, MAX_READ_LENGTH> m_readBuffer;
+    moodycamel::ConcurrentQueue<std::string> m_sendQueue; ///< 无锁发送队列
+    std::vector<std::string> m_batchMessages;             ///< 批次数据存储，持有生命周期
+    std::vector<boost::asio::const_buffer> m_batchViews;  ///< scatter-gather 视图
+    /// @}
+
+    /// @name Task 线程池——执行用户回调，与 IO 完全解耦
+    /// @{
+    boost::asio::io_context m_taskContext;
+    Strand m_taskStrand;
+    WorkGuardPtr m_taskWorkGuard;
+    Threads m_taskThreads;
+    /// @}
+
+    std::atomic<ClientState> m_connectionState{
+        ClientState::Disconnected};       ///< 连接状态（原子 CAS 保证线程安全转换）
+    std::atomic<bool> m_isWriting{false}; ///< 写循环飞行标志，防止 async_write 期间缓冲区被覆写
+
+    NetAddr m_connectTarget;      ///< 当前连接目标地址（仅在 IO strand 中读写）
+    size_t m_reconnectAttempt{0}; ///< 连续重连次数，用于指数退避（仅在 IO strand 中读写）
+
+    ClientCallback m_callback; ///< 应用层回调集合，仅在任务线程读写
 };
 
 } // namespace asio

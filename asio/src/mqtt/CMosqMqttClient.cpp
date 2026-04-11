@@ -12,8 +12,21 @@ CMosqMqttClient::~CMosqMqttClient() {}
 
 bool CMosqMqttClient::init(const Config& config) noexcept
 {
+    if (m_pImpl) {
+        return false;
+    }
+
     m_pImpl = make_shared_noexcept<Impl>();
-    return m_pImpl && m_pImpl->init(config);
+    if (!m_pImpl) {
+        return false;
+    }
+
+    if (!m_pImpl->init(config)) {
+        m_pImpl.reset();
+        return false;
+    }
+
+    return true;
 }
 
 bool CMosqMqttClient::connect() noexcept
@@ -32,22 +45,29 @@ void CMosqMqttClient::disconnect() noexcept
     }
 }
 
-bool CMosqMqttClient::publish(const std::string& topic, const std::string& payload) noexcept
+bool CMosqMqttClient::publish(
+    const std::string& topic, const char* payload, size_t length, int qos, bool retain) noexcept
 {
     if (!m_pImpl) {
         return false;
     }
-    return m_pImpl->publish(topic, payload);
+    return m_pImpl->publish(topic, payload, length, qos, retain);
 }
 
-bool CMosqMqttClient::publish(const std::string& topic, const char* payload, size_t length) noexcept
+bool CMosqMqttClient::publish(const std::string& topic,
+                              const std::string& payload,
+                              int qos,
+                              bool retain) noexcept
 {
-    return publish(topic, std::string(payload, length));
+    return publish(topic, payload.c_str(), payload.size(), qos, retain);
 }
 
-bool CMosqMqttClient::publish(const std::string& topic, std::string_view payload) noexcept
+bool CMosqMqttClient::publish(const std::string& topic,
+                              std::string_view payload,
+                              int qos,
+                              bool retain) noexcept
 {
-    return publish(topic, std::string(payload));
+    return publish(topic, payload.data(), payload.size(), qos, retain);
 }
 
 bool CMosqMqttClient::subscribe(const std::string& topic, int qos) noexcept

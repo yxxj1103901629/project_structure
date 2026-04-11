@@ -1,6 +1,10 @@
 #include "CTcpSession.h"
 #include "utils/CAtomicUtil.h"
 
+using namespace boost::asio;
+using namespace boost::system;
+using namespace boost::asio::error;
+
 namespace {
 
 constexpr size_t WRITE_BUFFER_BATCH = 16; // 每次批量发送的最大消息数量
@@ -9,16 +13,11 @@ constexpr size_t WRITE_BUFFER_BATCH = 16; // 每次批量发送的最大消息�
 
 namespace asio {
 
-CTcpSession::CTcpSession(tcp::socket socket,
-                         boost::asio::io_context& io,
-                         ServerCallback::ErrorCb&& errorcb,
-                         ServerCallback::MsgCb&& msgcb,
-                         ServerCallback::AddrCb&& disconnectcb)
+CTcpSession::CTcpSession(tcp::socket socket, io_context& io, ISessionObserver* observer)
     : m_socket(std::move(socket))
-    , m_writeStrand(boost::asio::make_strand(io))
-    , m_errorcb(std::move(errorcb))
-    , m_msgcb(std::move(msgcb))
-    , m_disconnectcb(std::move(disconnectcb))
+    , m_readStrand(make_strand(io))
+    , m_writeStrand(make_strand(io))
+    , m_observer(observer)
 {}
 
 CTcpSession::~CTcpSession()
@@ -35,22 +34,13 @@ bool CTcpSession::start() noexcept
     try {
         const auto& endpoint = m_socket.remote_endpoint();
         m_clientAddr = NetAddr{endpoint.address().to_string(), endpoint.port()};
+        m_writeBuffer.resize(WRITE_BUFFER_BATCH);
+        m_sendBuffers.reserve(WRITE_BUFFER_BATCH);
     } catch (const std::exception& ex) {
-        reportError("获取客户端地址失败: " + std::string(ex.what()));
+        reportError("启动会话失败: " + std::string(ex.what()));
         return false;
     } catch (...) {
-        reportError("获取客户端地址发生未知错误");
-        return false;
-    }
-
-    try {
-        m_writeBuffer.resize(WRITE_BUFFER_BATCH);  // 一次性构造好槽位，后续不再析构/构造
-        m_sendBuffers.reserve(WRITE_BUFFER_BATCH); // 预分配 const_buffer 序列容量
-    } catch (const std::exception& ex) {
-        reportError("初始化发送缓冲失败: " + std::string(ex.what()));
-        return false;
-    } catch (...) {
-        reportError("初始化发送缓冲发生未知错误");
+        reportError("启动会话发生未知错误");
         return false;
     }
 
@@ -70,7 +60,7 @@ void CTcpSession::send(std::string&& data) noexcept
 
     m_msgQueue.enqueue(std::move(data)); // 将消息添加到发送队列
 
-    boost::asio::post(m_writeStrand, [self = shared_from_this()]() {
+    post(m_writeStrand, [self = shared_from_this()]() {
         // 如果当前没有正在发送的消息，启动发送流程
         if (!CAtomicUtil::exchange(self->m_isWriting, true)) {
             self->doWrite(); // 启动发送流程
@@ -85,8 +75,8 @@ void CTcpSession::close() noexcept
     }
 
     // 通过串行化执行器异步关闭连接，确保线程安全
-    boost::asio::post(m_writeStrand, [self = shared_from_this()]() {
-        boost::system::error_code ec;
+    post(m_writeStrand, [self = shared_from_this()]() {
+        error_code ec;
         // 先关闭发送和接收，然后关闭套接字
         [[maybe_unused]] auto se = self->m_socket.shutdown(tcp::socket::shutdown_both, ec);
         [[maybe_unused]] auto ce = self->m_socket.close(ec);
@@ -102,7 +92,7 @@ void CTcpSession::doRead() noexcept
     // 获取shared_ptr以保持对象生命周期
     auto self = shared_from_this();
     // 定义读取完成后的回调函数，处理读取结果
-    auto onRead = [self](boost::system::error_code ec, std::size_t len) {
+    auto onRead = [self](error_code ec, std::size_t len) {
         if (!ec && len > 0) { // 成功读取数据
             // 成功读取数据，触发消息回调并继续读取下一个数据包
             self->reportMessage(self->m_readBuffer.data(), len);
@@ -110,8 +100,11 @@ void CTcpSession::doRead() noexcept
             return;
         }
 
-        // 处理错误情况（包括正常关闭和异常错误）
-        using namespace boost::asio::error;
+        // 由 close() 主动取消的操作，不触发断开回调
+        if (ec == operation_aborted) {
+            return;
+        }
+
         if (ec && ec != eof && ec != connection_reset && ec != connection_aborted) {
             // 发生非正常断开以外的错误，报告错误信息
             self->reportError("读取数据失败: " + ec.message());
@@ -122,74 +115,59 @@ void CTcpSession::doRead() noexcept
         self->close();
     };
 
-    // 异步读取数据到 m_readBuffer，读取完成后调用 onRead 处理结果
-    m_socket.async_read_some(boost::asio::buffer(m_readBuffer), onRead);
+    // 异步读取数据到 m_readBuffer，将完成回调绑定到 m_readStrand
+    // 读写使用独立 strand，允许读写并发；socket.close() 会原子取消所有待定 I/O
+    m_socket.async_read_some(boost::asio::buffer(m_readBuffer), bind_executor(m_readStrand, onRead));
 }
 
 void CTcpSession::doWrite() noexcept
 {
-    try {
-        // 检查连接状态和消息队列
-        if (!CAtomicUtil::load(m_isConnected)) {
-            CAtomicUtil::store(m_isWriting, false);
-            return;
-        }
-
-        const auto& count = m_msgQueue.try_dequeue_bulk(m_writeBuffer.data(), WRITE_BUFFER_BATCH);
-        if (count == 0) {
-            CAtomicUtil::store(m_isWriting, false);
-            return;
-        }
-
-        // 构建 const_buffer 序列，复用 m_writeBuffer 中的字符串数据
-        m_sendBuffers.clear();
-        for (size_t i = 0; i < count; ++i) {
-            m_sendBuffers.emplace_back(boost::asio::buffer(m_writeBuffer[i]));
-        }
-
-        auto self = shared_from_this();
-        auto onComplete = [self](boost::system::error_code ec, std::size_t) {
-            if (ec) {
-                self->reportError("发送数据失败: " + ec.message());
-                self->close();
-            } else {
-                self->doWrite(); // 继续发送下一批消息
-            }
-        };
-
-        // 使用串行化执行器确保发送操作按顺序执行
-        boost::asio::async_write(m_socket,
-                                 m_sendBuffers,
-                                 boost::asio::bind_executor(m_writeStrand, onComplete));
-    } catch (const std::exception& ex) {
-        reportError("发送数据失败: " + std::string(ex.what()));
-        close();
-    } catch (...) {
-        reportError("发送数据发生未知错误");
-        close();
+    if (!CAtomicUtil::load(m_isConnected)) {
+        CAtomicUtil::store(m_isWriting, false);
+        return;
     }
+
+    const auto count = m_msgQueue.try_dequeue_bulk(m_writeBuffer.data(), WRITE_BUFFER_BATCH);
+    if (count == 0) {
+        CAtomicUtil::store(m_isWriting, false);
+        return;
+    }
+
+    m_sendBuffers.clear();
+    for (size_t i = 0; i < count; ++i) {
+        m_sendBuffers.emplace_back(boost::asio::buffer(m_writeBuffer[i]));
+    }
+
+    auto self = shared_from_this();
+    async_write(m_socket,
+                m_sendBuffers,
+                bind_executor(m_writeStrand, [self](error_code ec, std::size_t) {
+                    if (ec) {
+                        CAtomicUtil::store(self->m_isWriting, false);
+                        self->reportError("发送数据失败: " + ec.message());
+                        self->close();
+                    } else {
+                        self->doWrite();
+                    }
+                }));
 }
 
 void CTcpSession::reportError(const std::string& msg) noexcept
 {
-    if (m_errorcb) {
-        m_errorcb(msg); // 直接调用错误回调，传递错误信息
-    }
+    if (m_observer)
+        m_observer->onSessionError(msg);
 }
 
 void CTcpSession::reportMessage(const char* data, size_t length) noexcept
 {
-    if (m_msgcb) {
-        auto msg = std::string_view(data, length);
-        m_msgcb(m_clientAddr, msg); // 直接调用消息回调，传递客户端地址和消息内容
-    }
+    if (m_observer)
+        m_observer->onSessionMessage(m_clientAddr, {data, length});
 }
 
 void CTcpSession::reportDisconnect() noexcept
 {
-    if (m_disconnectcb) {
-        m_disconnectcb(m_clientAddr); // 直接调用断开回调，传递客户端地址
-    }
+    if (m_observer)
+        m_observer->onSessionDisconnected(m_clientAddr);
 }
 
 } // namespace asio

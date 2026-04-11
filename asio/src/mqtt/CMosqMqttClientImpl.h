@@ -8,6 +8,12 @@ namespace mosq {
 
 class CMosqMqttClient::Impl : public mosqpp::mosquittopp
 {
+    enum State : int {
+        DISCONNECTED = 0, ///< 已断开连接
+        CONNECTING = 1,   ///< 正在连接中
+        CONNECTED = 2     ///< 已连接
+    };
+
 public:
     Impl();
     ~Impl();
@@ -16,7 +22,11 @@ public:
     bool init(const Config &config) noexcept;
     bool connect() noexcept;
     void disconnect() noexcept;
-    bool publish(const std::string &topic, const std::string &payload) noexcept;
+    bool publish(const std::string &topic,
+                 const char *payload,
+                 size_t payloadlen,
+                 int qos,
+                 bool retain) noexcept;
     bool subscribe(const std::string &topic, int qos) noexcept;
     bool unsubscribe(const std::string &topic) noexcept;
     void setCallback(const ClientCallback &callback) noexcept;
@@ -54,6 +64,8 @@ private:
     std::string m_password;      ///< 认证密码
 
     std::atomic<bool> m_initialized{false}; ///< 是否已初始化标志
+
+    std::atomic<State> m_state{State::DISCONNECTED}; ///< 当前连接状态
 
     ClientCallback m_callback; ///< 用户回调集合
 };

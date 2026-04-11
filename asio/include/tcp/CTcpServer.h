@@ -38,7 +38,6 @@ public:
 
     bool sendToClient(const NetAddr& clientAddr, std::string_view data) noexcept;
     bool sendToClient(const NetAddr& clientAddr, const std::string& data) noexcept;
-    bool sendToClient(const NetAddr& clientAddr, std::string&& data) noexcept;
     bool sendToClient(const NetAddr& clientAddr, const char* data, size_t length) noexcept;
 
     bool broadcast(std::string_view data) noexcept;
