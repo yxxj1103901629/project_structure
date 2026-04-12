@@ -1,0 +1,60 @@
+# Ignore build artifacts and other generated files
+.cache/
+build/
+bin/
+.vscode/
+third_party/lib/
+third_party/bin/
+
+# 编译输出（目标文件 / 库 / 可执行文件）
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dll
+*.exe
+*.app
+*.lib
+*.lo
+*.la
+*.lai
+
+
+# Visual Studio 生成文件
+*.vs/
+*.qtvscr
+*.vcxproj.*
+*.sln
+*.suo
+*.vcxproj
+*.vcxproj.user
+*.vcproj.*
+*.ncb
+*.sdf
+*.opensdf
+*.idb
+*.ilk
+*.pdb
+*.exp
+*.ib_pdb_index
+
+# MinGW 构建目录
+*.Debug
+*.Release
+
+# 临时文件 / 备份文件
+*~
+*.swp
+.*.swp
+*.flc
+*.orig
+*.rej
+*.*#
+.#*
+*.tmp
+*.bak
+*.log
+*.dmp
+*.bkp
+

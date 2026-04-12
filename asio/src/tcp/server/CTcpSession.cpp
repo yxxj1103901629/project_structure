@@ -1,5 +1,6 @@
 #include "CTcpSession.h"
 #include "utils/CAtomicUtil.h"
+#include "utils/MakeHelper.h"
 
 using namespace boost::asio;
 using namespace boost::system;
@@ -60,9 +61,10 @@ void CTcpSession::send(std::string&& data) noexcept
 
     m_msgQueue.enqueue(std::move(data)); // 将消息添加到发送队列
 
-    post(m_writeStrand, [self = shared_from_this()]() {
+    post(m_writeStrand, [weak = make_weak_noexcept(shared_from_this())]() {
+        auto self = weak.lock();
         // 如果当前没有正在发送的消息，启动发送流程
-        if (!CAtomicUtil::exchange(self->m_isWriting, true)) {
+        if (self && !CAtomicUtil::exchange(self->m_isWriting, true)) {
             self->doWrite(); // 启动发送流程
         }
     });
@@ -75,7 +77,10 @@ void CTcpSession::close() noexcept
     }
 
     // 通过串行化执行器异步关闭连接，确保线程安全
-    post(m_writeStrand, [self = shared_from_this()]() {
+    post(m_writeStrand, [weak = make_weak_noexcept(shared_from_this())]() {
+        auto self = weak.lock();
+        if (!self)
+            return;
         error_code ec;
         // 先关闭发送和接收，然后关闭套接字
         [[maybe_unused]] auto se = self->m_socket.shutdown(tcp::socket::shutdown_both, ec);
@@ -89,7 +94,8 @@ void CTcpSession::doRead() noexcept
         return; // 连接已关闭，不再执行读取操作
     }
 
-    // 获取shared_ptr以保持对象生命周期
+    // 强指针捕获 self：m_readBuffer 是 async_read_some 的 DMA 目标，
+    // 回调触发前 buffer 必须持续有效；弱指针 lock 失败会导致 buffer 悬空（UB）。
     auto self = shared_from_this();
     // 定义读取完成后的回调函数，处理读取结果
     auto onRead = [self](error_code ec, std::size_t len) {
@@ -138,6 +144,8 @@ void CTcpSession::doWrite() noexcept
         m_sendBuffers.emplace_back(boost::asio::buffer(m_writeBuffer[i]));
     }
 
+    // 强指针捕获 self：m_writeBuffer / m_sendBuffers 是 async_write 的散列写 buffer，
+    // 回调触发前这些成员必须持续有效；弱指针 lock 失败会导致 buffer 悬空（UB）。
     auto self = shared_from_this();
     async_write(m_socket,
                 m_sendBuffers,

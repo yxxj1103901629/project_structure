@@ -45,3 +45,17 @@ inline std::shared_ptr<T> make_shared_noexcept(Args &&...args) noexcept
         return nullptr;
     }
 }
+
+/**
+ * @brief 安全的std::weak_ptr封装，捕获异常并返回空weak_ptr
+ * @tparam T 要创建的对象类型
+ */
+template<typename T>
+inline std::weak_ptr<T> make_weak_noexcept(const std::shared_ptr<T> &sp) noexcept
+{
+    try {
+        return std::weak_ptr<T>(sp);
+    } catch (...) {
+        return std::weak_ptr<T>();
+    }
+}

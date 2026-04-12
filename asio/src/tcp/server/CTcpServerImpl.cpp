@@ -160,13 +160,18 @@ bool CTcpServer::Impl::startPool(size_t n,
 ** stop() — 状态转换：Running → Idle
 **
 ** 关键流程（顺序不可乱）：
-**   1. acceptor 取消 + 关闭，防止新连接进入
-**   2. O(1) 原子接管 session 映射，最小化持锁时间
-**   3. 逐个 close session 并触发 disconnected 回调
-**   4. 释放 work_guard，让 context.run() 可以退出
-**   5. 显式 stop context（加速退出，防止异步任务拖延）
-**   6. join 所有线程，保证所有回调执行完毕
-**   7. restart context，允许后续重新 listen
+**   1. acceptor 取消 + 关闭，触发 onAccept 以 operation_aborted 结束循环，释放 shared_ptr<Impl>
+**   2. O(1) 原子接管 session 映射
+**   3. 关闭所有 session（异步 shutdown+close 投递到 writeStrand）
+**   4. reset IO work_guard，让 IO 自然排空（所有 close/read 回调结束后 run() 返回）
+**   5. join IO 线程（等待所有 IO 回调彻底完成，不遗留任何 shared_ptr 引用）
+**   6. reset task work_guard + join task 线程（drain 所有已投递的用户回调）
+**   7. 直接调用 clientDisconnected（针对 stop() 主动关闭的 session）
+**   8. restart context，允许后续重新 listen
+**
+** !! 不调用 ioContext.stop() !!
+**    stop() 会遗弃仍持有 shared_ptr<Impl> 的 pending handler（如 onAccept lambda），
+**    导致 Impl 引用计数永不归零，~Impl() 永远不会运行。
 ** ───────────────────────────────────────────────────────────────────────── */
 
 void CTcpServer::Impl::stop() noexcept
@@ -176,7 +181,8 @@ void CTcpServer::Impl::stop() noexcept
     if (!CAtomicUtil::compareExchange(m_state, expected, ServerState::Idle))
         return;
 
-    // ② 停止 acceptor，新连接不再进入
+    // ② 取消/关闭 acceptor；onAccept lambda 收到 operation_aborted 后检查状态退出循环，
+    //   释放捕获的 shared_ptr<Impl>，Impl 引用计数恢复正常
     boost::system::error_code ec;
     [[maybe_unused]] auto r1 = m_acceptor.cancel(ec);
     [[maybe_unused]] auto r2 = m_acceptor.close(ec);
@@ -188,33 +194,34 @@ void CTcpServer::Impl::stop() noexcept
         sessions = std::move(m_sessions);
     }
 
-    // ④ 逐个关闭 session 并向任务线程投递 disconnected 回调
-    for (auto& kv : sessions) {
+    // ④ 对每个 session 投递异步 shutdown+close；socket 关闭后 async_read_some 以错误完成，
+    //   doRead 退出，readStrand 上无更多工作
+    for (auto& kv : sessions)
         kv.second->close();
-        const NetAddr addr = kv.first;
-        postTask([addr](Impl& self) {
-            if (self.m_callback.clientDisconnected)
-                self.m_callback.clientDisconnected(addr);
-        });
-    }
 
-    // ⑤ 释放 work_guard + stop context，驱使所有线程从 run() 返回
+    // ⑤ 只 reset work_guard，不调用 ioContext.stop()——让 IO context 自然排空后退出；
+    //   所有 accept/close/read 回调处理完毕后 run() 自动返回
     m_ioWorkGuard.reset();
-    m_taskWorkGuard.reset();
-    m_ioContext.stop();
-    m_taskContext.stop();
-
-    // ⑥ join 全部线程——此时所有已投递的 postTask 均已执行完毕
     auto joinAll = [](Threads& pool) {
         for (auto& t : pool)
             if (t.joinable())
                 t.join();
         pool.clear();
     };
-    joinAll(m_ioThreads);
+    joinAll(m_ioThreads); // 等待所有 IO 回调（close/read/accept）彻底完成
+
+    // ⑥ drain task 线程（IO 线程退出后不再产生新任务，让已有回调全部执行完毕）
+    m_taskWorkGuard.reset();
     joinAll(m_taskThreads);
 
-    // ⑦ restart 使 context 可被下一次 listen 重复使用
+    // ⑦ 直接在当前线程触发 clientDisconnected，针对 stop() 主动关闭的 session；
+    //   自然断开的 session 已在 onSessionDisconnected→postTask 路径触发（⑥ drain 时执行）
+    if (m_callback.clientDisconnected) {
+        for (auto& kv : sessions)
+            m_callback.clientDisconnected(kv.first);
+    }
+
+    // ⑧ restart 使 context 可被下一次 listen 重复使用
     m_ioContext.restart();
     m_taskContext.restart();
 }
@@ -272,16 +279,18 @@ void CTcpServer::Impl::setCallback(ServerCallback&& callback) noexcept
 ** onAccept() — 异步接入循环
 **
 ** 每次 async_accept 完成后：
-**   - 若服务器已停止（状态 != Running）则直接退出，终止循环
+**   - 以弱指针捕获 self；lock() 失败（Impl 已销毁）或状态非 Running 时终止循环
 **   - 出错则上报，但继续投递下一轮（瞬时错误不中断服务）
 **   - 成功则将 socket 交给 registerSession 完成后续注册
 ** ───────────────────────────────────────────────────────────────────────── */
 
 void CTcpServer::Impl::onAccept() noexcept
 {
-    m_acceptor.async_accept([self = shared_from_this()](error_code ec, tcp::socket socket) {
-        // 服务器已停止，终止接入循环
-        if (CAtomicUtil::load(self->m_state) != ServerState::Running)
+    auto weak = make_weak_noexcept(shared_from_this());
+    m_acceptor.async_accept([weak](error_code ec, tcp::socket socket) {
+        auto self = weak.lock();
+        // 服务器已销毁或已停止，终止接入循环
+        if (!self || CAtomicUtil::load(self->m_state) != ServerState::Running)
             return;
 
         if (ec)
@@ -386,14 +395,18 @@ void CTcpServer::Impl::onSessionError(const std::string& msg) noexcept
 /* ─────────────────────────────────────────────────────────────────────────
 ** postTask() — Command 模式：任务投递
 **
-** 以 shared_ptr 捕获 self，保证 Impl 在回调执行期间不被析构；
+** 以弱指针捕获 self，回调执行时 lock() 失败（Impl 已销毁）则跳过，
+** 不持有强引用，不延长 Impl 生命周期；
 ** task 以值语义移动进 lambda 避免拷贝开销。
 ** ───────────────────────────────────────────────────────────────────────── */
 
 void CTcpServer::Impl::postTask(std::function<void(Impl&)> task) noexcept
 {
-    auto self = shared_from_this();
-    post(m_taskContext, [self, t = std::move(task)]() mutable { t(*self); });
+    auto weak = make_weak_noexcept(shared_from_this());
+    post(m_taskContext, [weak, t = std::move(task)]() mutable {
+        if (auto self = weak.lock())
+            t(*self);
+    });
 }
 
 } // namespace asio

@@ -40,14 +40,14 @@ int main()
     }
 
     std::cout << "服务器已启动，监听端口 40004" << std::endl;
-    std::cout << "将在 5 秒后自动退出..." << std::endl;
+    std::cout << "将在 3 秒后自动退出..." << std::endl;
 
-    // 运行 5 秒后退出
-    std::this_thread::sleep_for(5s);
+    // 运行 3 秒后退出
+    std::this_thread::sleep_for(3s);
 
     std::cout << "服务器停止中..." << std::endl;
-    server.stop();
-    std::this_thread::sleep_for(1s); // 等待服务器完全停止
+    // server.stop();
+    // std::this_thread::sleep_for(1s); // 等待服务器完全停止
     std::cout << "测试完成" << std::endl;
 
     return 0;

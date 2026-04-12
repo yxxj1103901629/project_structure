@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Defs.h"
+#include "NetDefs.h"
 #include <memory>
 
 #ifdef NETWORK_EXPORTS

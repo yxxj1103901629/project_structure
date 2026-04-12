@@ -1,6 +1,5 @@
 #pragma once
 
-#include "Defs.h"
 #include "tcp/CTcpClient.h"
 
 #include <boost/asio.hpp>
@@ -152,12 +151,14 @@ private:
 
     /**
      * @brief 向 IO strand 投递任务（在 IO 线程串行执行）。
+     * @details 以弱指针捕获 self，回调执行时 lock() 失败（Impl 已销毁）则跳过。
      * @param[in] task 签名为 void(Impl&) 的可调用对象。
      */
     void postIo(std::function<void(Impl&)> task) noexcept;
 
     /**
      * @brief 向 Task strand 投递任务（在任务线程串行执行）。
+     * @details 以弱指针捕获 self，回调执行时 lock() 失败（Impl 已销毁）则跳过。
      * @param[in] task 签名为 void(Impl&) 的可调用对象。
      */
     void postTask(std::function<void(Impl&)> task) noexcept;

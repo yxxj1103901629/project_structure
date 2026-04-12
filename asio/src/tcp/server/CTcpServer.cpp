@@ -15,7 +15,11 @@ CTcpServer::CTcpServer()
     : m_pImpl(make_shared_noexcept<Impl>())
 {}
 
-CTcpServer::~CTcpServer() = default;
+CTcpServer::~CTcpServer()
+{
+    if (m_pImpl)
+        m_pImpl->stop();
+}
 
 bool CTcpServer::init(size_t threads) noexcept
 {

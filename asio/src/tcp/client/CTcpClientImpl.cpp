@@ -247,9 +247,11 @@ void CTcpClient::Impl::doConnect() noexcept
         m_socket = tcp::socket(m_ioContext);
 
         // ⑤ 发起异步连接，结果在 onConnect 中处理
-        auto token = bind_executor(m_ioStrand, [self = shared_from_this()](error_code ec) {
-            self->onConnect(ec);
-        });
+        auto token = bind_executor(m_ioStrand,
+                                   [weak = make_weak_noexcept(shared_from_this())](error_code ec) {
+                                       if (auto self = weak.lock())
+                                           self->onConnect(ec);
+                                   });
         m_socket.async_connect(endpoint, token);
 
         guard.release(); // 投递成功，状态由 onConnect 负责后续更新
@@ -307,16 +309,20 @@ void CTcpClient::Impl::doDisconnect(bool isReTry) noexcept
         return;
 
     m_reconnectTimer.expires_after(calculateReconnectDelay(m_reconnectAttempt));
-    auto self = shared_from_this();
-    m_reconnectTimer.async_wait(bind_executor(m_ioStrand, [self](const error_code& ec) {
-        if (ec == operation_aborted)
-            return; // 定时器被取消（手动 disconnect() 触发）
-        if (ec) {
-            self->reportError("重连定时器异常: " + ec.message());
-            return;
-        }
-        self->doConnect();
-    }));
+    m_reconnectTimer.async_wait(
+        bind_executor(m_ioStrand,
+                      [weak = make_weak_noexcept(shared_from_this())](const error_code& ec) {
+                          if (ec == operation_aborted)
+                              return; // 定时器被取消（手动 disconnect() 触发）
+                          auto self = weak.lock();
+                          if (!self)
+                              return;
+                          if (ec) {
+                              self->reportError("重连定时器异常: " + ec.message());
+                              return;
+                          }
+                          self->doConnect();
+                      }));
 }
 
 /* doRead() — 投递 async_read_some，非 Connected 状态时终止读循环。*/
@@ -434,16 +440,22 @@ void CTcpClient::Impl::reportError(const std::string& msg) noexcept
 
 void CTcpClient::Impl::postIo(std::function<void(Impl&)> task) noexcept
 {
-    boost::asio::post(m_ioStrand, [self = shared_from_this(), task = std::move(task)]() mutable {
-        task(*self);
-    });
+    boost::asio::post(m_ioStrand,
+                      [weak = make_weak_noexcept(shared_from_this()),
+                       task = std::move(task)]() mutable {
+                          if (auto self = weak.lock())
+                              task(*self);
+                      });
 }
 
 void CTcpClient::Impl::postTask(std::function<void(Impl&)> task) noexcept
 {
-    boost::asio::post(m_taskStrand, [self = shared_from_this(), task = std::move(task)]() mutable {
-        task(*self);
-    });
+    boost::asio::post(m_taskStrand,
+                      [weak = make_weak_noexcept(shared_from_this()),
+                       task = std::move(task)]() mutable {
+                          if (auto self = weak.lock())
+                              task(*self);
+                      });
 }
 
 /* ─────────────────────────────────────────────────────────────────────────

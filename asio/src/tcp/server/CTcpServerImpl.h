@@ -36,7 +36,8 @@ enum class ServerState : uint8_t {
  *          对外只通过 CTcpServer 公共接口暴露行为。
  *
  * 设计要点：
- * - 继承 std::enable_shared_from_this，在异步回调中安全传递 self 所有权。
+ * - 继承 std::enable_shared_from_this，在异步回调中以弱指针捕获 self，
+ *   回调执行时 lock() 失败即跳过，不延长 Impl 生命周期。
  * - 继承 ISessionObserver，直接接收每个 CTcpSession 上报的事件，
  *   无需为每个 session 单独注册独立的 lambda。
  * - IO 线程池与 Task 线程池分离，用户回调不占用 IO 线程。
@@ -146,7 +147,7 @@ private:
 
     /**
      * @brief 投递下一轮 async_accept，循环驱动客户端接入。
-     * @note 在回调内自我递归投递，非 Running 状态时终止循环。
+     * @note 回调以弱指针捕获 self；lock() 失败或状态非 Running 时终止循环。
      */
     void onAccept() noexcept;
 
@@ -191,8 +192,8 @@ private:
     /**
      * @brief Command 模式：将任务投递到专用任务线程执行。
      *
-     * @details 以 shared_from_this() 捕获 self，保证 Impl 在回调执行期间不被析构；
-     *          task 以移动语义传入，避免 std::function 的多余拷贝。
+     * @details 以弱指针捕获 self，回调执行时 lock() 失败（Impl 已销毁）则跳过，
+     *          不阻止 Impl 析构；task 以移动语义传入，避免 std::function 的多余拷贝。
      *
      * @param[in] task 待执行的可调用对象，签名为 @c void(Impl&)。
      */
