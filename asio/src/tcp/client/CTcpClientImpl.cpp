@@ -27,7 +27,7 @@ constexpr size_t RECONNECT_MAX_EXPONENT = 5;
  * @param[in,out] attempt 当前重连尝试次数，函数内部自动递增。
  * @return 返回本次应等待的时长。
  */
-inline std::chrono::steady_clock::duration calculateReconnectDelay(size_t& attempt) noexcept
+inline std::chrono::steady_clock::duration calculateReconnectDelay(size_t &attempt) noexcept
 {
     const auto exp = std::min(attempt, RECONNECT_MAX_EXPONENT);
     auto delay = RECONNECT_BASE_DELAY * static_cast<int>(1ULL << exp);
@@ -76,8 +76,8 @@ CTcpClient::Impl::~Impl()
     m_taskContext.stop();
 
     // ④ join 全部线程，此时所有已投递的回调均已执行完毕
-    auto joinAll = [](Threads& threads) {
-        for (auto& t : threads)
+    auto joinAll = [](Threads &threads) {
+        for (auto &t : threads)
             if (t.joinable())
                 t.join();
         threads.clear();
@@ -104,7 +104,7 @@ bool CTcpClient::Impl::init() noexcept
     // ② RAII Guard：失败时回滚 m_initialized = false
     struct Guard
     {
-        CTcpClient::Impl* impl;
+        CTcpClient::Impl *impl;
         bool ok = false;
         ~Guard() { CAtomicUtil::store(impl->m_initialized, ok); }
         void release() noexcept { ok = true; }
@@ -114,7 +114,7 @@ bool CTcpClient::Impl::init() noexcept
     try {
         m_batchMessages.resize(WRITE_BUFFER_BATCH);
         m_batchViews.reserve(WRITE_BUFFER_BATCH);
-    } catch (const std::exception& ex) {
+    } catch (const std::exception &ex) {
         reportError("初始化缓冲失败: " + std::string(ex.what()));
         return false;
     } catch (...) {
@@ -138,7 +138,7 @@ bool CTcpClient::Impl::init() noexcept
 ** 先 disconnect() 清理旧连接，再向 IO strand 投递 doConnect() 任务。
 ** m_connectTarget 在 strand 内赋值，保证与 doConnect 的读操作无竞态。
 ** ───────────────────────────────────────────────────────────────────────── */
-bool CTcpClient::Impl::connect(const NetAddr& serverAddr) noexcept
+bool CTcpClient::Impl::connect(const NetAddr &serverAddr) noexcept
 {
     if (!CAtomicUtil::load(m_initialized)) {
         reportError("客户端未初始化");
@@ -147,7 +147,7 @@ bool CTcpClient::Impl::connect(const NetAddr& serverAddr) noexcept
 
     disconnect(); // 确保之前的连接已清理
 
-    postIo([serverAddr](Impl& self) {
+    postIo([serverAddr](Impl &self) {
         self.m_connectTarget = serverAddr;
         self.doConnect();
     });
@@ -161,7 +161,7 @@ void CTcpClient::Impl::disconnect() noexcept
     if (!CAtomicUtil::load(m_initialized))
         return;
 
-    postIo([](Impl& self) {
+    postIo([](Impl &self) {
         self.m_reconnectAttempt = 0;    // 重置退避计数，下次 connect() 从初始延迟开始
         self.m_reconnectTimer.cancel(); // 取消已挂起的重连定时器
         self.doDisconnect(false);       // false = 不自动重连
@@ -187,7 +187,7 @@ bool CTcpClient::Impl::send(std::string_view data) noexcept
     m_sendQueue.enqueue(std::string(data));
 
     // 仅当无飞行中的 async_write 时才触发，避免覆写正在使用的缓冲区
-    postIo([](Impl& self) {
+    postIo([](Impl &self) {
         if (!CAtomicUtil::exchange(self.m_isWriting, true))
             self.doWrite();
     });
@@ -195,16 +195,16 @@ bool CTcpClient::Impl::send(std::string_view data) noexcept
     return true;
 }
 
-void CTcpClient::Impl::setCallback(const ClientCallback& callback) noexcept
+void CTcpClient::Impl::setCallback(const ClientCallback &callback) noexcept
 {
     // 直接拷贝回调对象，确保调用者的回调对象生命周期与客户端一致
-    postTask([callback](Impl& self) { self.m_callback = callback; });
+    postTask([callback](Impl &self) { self.m_callback = callback; });
 }
 
-void CTcpClient::Impl::setCallback(ClientCallback&& callback) noexcept
+void CTcpClient::Impl::setCallback(ClientCallback &&callback) noexcept
 {
     // 移动回调对象，避免不必要的拷贝开销，适用于临时对象或不再使用的回调对象
-    postTask([cb = std::move(callback)](Impl& self) { self.m_callback = std::move(cb); });
+    postTask([cb = std::move(callback)](Impl &self) { self.m_callback = std::move(cb); });
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ void CTcpClient::Impl::doConnect() noexcept
     CAtomicUtil::store(m_connectionState, ClientState::Connecting);
     struct Guard
     {
-        CTcpClient::Impl* impl;
+        CTcpClient::Impl *impl;
         bool ok = false;
         ~Guard()
         {
@@ -255,7 +255,7 @@ void CTcpClient::Impl::doConnect() noexcept
         m_socket.async_connect(endpoint, token);
 
         guard.release(); // 投递成功，状态由 onConnect 负责后续更新
-    } catch (const std::exception& ex) {
+    } catch (const std::exception &ex) {
         reportError("连接异常: " + std::string(ex.what()));
     } catch (...) {
         reportError("连接发生未知异常");
@@ -263,9 +263,10 @@ void CTcpClient::Impl::doConnect() noexcept
 }
 
 /* onConnect() — 状态转换：Connecting → Connected 或 → Disconnected（含重连）
-** 注意：失败时不能先 store(Disconnected)，否则 doDisconnect() 内的 exchange 判断
+** 注意：失败时不能先 store(Disconnected)，否则 doDisconnect() 内的 exchange
+* 判断
 ** 提前返回，导致重连定时器无法启动。*/
-void CTcpClient::Impl::onConnect(const error_code& ec) noexcept
+void CTcpClient::Impl::onConnect(const error_code &ec) noexcept
 {
     if (ec) {
         reportError("连接失败: " + ec.message());
@@ -311,7 +312,7 @@ void CTcpClient::Impl::doDisconnect(bool isReTry) noexcept
     m_reconnectTimer.expires_after(calculateReconnectDelay(m_reconnectAttempt));
     m_reconnectTimer.async_wait(
         bind_executor(m_ioStrand,
-                      [weak = make_weak_noexcept(shared_from_this())](const error_code& ec) {
+                      [weak = make_weak_noexcept(shared_from_this())](const error_code &ec) {
                           if (ec == operation_aborted)
                               return; // 定时器被取消（手动 disconnect() 触发）
                           auto self = weak.lock();
@@ -338,7 +339,7 @@ void CTcpClient::Impl::doRead() noexcept
                              }));
 }
 
-void CTcpClient::Impl::onRead(const error_code& ec, size_t len) noexcept
+void CTcpClient::Impl::onRead(const error_code &ec, size_t len) noexcept
 {
     if (ec) {
         if (ec == operation_aborted) {
@@ -382,7 +383,8 @@ void CTcpClient::Impl::doWrite() noexcept
         m_batchViews.emplace_back(boost::asio::buffer(m_batchMessages[i]));
     }
 
-    // async_write 的 error_code 重载不抛异常，m_isWriting 保持 true 直到 onWrite 回调
+    // async_write 的 error_code 重载不抛异常，m_isWriting 保持 true 直到 onWrite
+    // 回调
     auto self = shared_from_this();
     boost::asio::async_write(m_socket,
                              m_batchViews,
@@ -391,7 +393,7 @@ void CTcpClient::Impl::doWrite() noexcept
                              }));
 }
 
-void CTcpClient::Impl::onWrite(const error_code& ec, size_t len) noexcept
+void CTcpClient::Impl::onWrite(const error_code &ec, size_t len) noexcept
 {
     if (ec) {
         CAtomicUtil::store(m_isWriting, false); // 异步回调中手动重置
@@ -407,7 +409,7 @@ void CTcpClient::Impl::onWrite(const error_code& ec, size_t len) noexcept
 /* reportXxx — 事件上报：通过 postTask 投递到任务线程，不占用 IO 线程。*/
 void CTcpClient::Impl::reportConnected() noexcept
 {
-    postTask([](Impl& self) {
+    postTask([](Impl &self) {
         if (self.m_callback.connected)
             self.m_callback.connected(self.m_connectTarget);
     });
@@ -415,30 +417,30 @@ void CTcpClient::Impl::reportConnected() noexcept
 
 void CTcpClient::Impl::reportDisconnected() noexcept
 {
-    postTask([](Impl& self) {
+    postTask([](Impl &self) {
         if (self.m_callback.disconnected)
             self.m_callback.disconnected(self.m_connectTarget);
     });
 }
 
-void CTcpClient::Impl::reportMessageReceived(const char* data, size_t length) noexcept
+void CTcpClient::Impl::reportMessageReceived(const char *data, size_t length) noexcept
 {
     auto msg = std::string(data, length);
-    postTask([msg = std::move(msg)](Impl& self) {
+    postTask([msg = std::move(msg)](Impl &self) {
         if (self.m_callback.messageReceived)
             self.m_callback.messageReceived(std::string_view(msg));
     });
 }
 
-void CTcpClient::Impl::reportError(const std::string& msg) noexcept
+void CTcpClient::Impl::reportError(const std::string &msg) noexcept
 {
-    postTask([msg](Impl& self) {
+    postTask([msg](Impl &self) {
         if (self.m_callback.errorOccurred)
             self.m_callback.errorOccurred(msg);
     });
 }
 
-void CTcpClient::Impl::postIo(std::function<void(Impl&)> task) noexcept
+void CTcpClient::Impl::postIo(std::function<void(Impl &)> task) noexcept
 {
     boost::asio::post(m_ioStrand,
                       [weak = make_weak_noexcept(shared_from_this()),
@@ -448,7 +450,7 @@ void CTcpClient::Impl::postIo(std::function<void(Impl&)> task) noexcept
                       });
 }
 
-void CTcpClient::Impl::postTask(std::function<void(Impl&)> task) noexcept
+void CTcpClient::Impl::postTask(std::function<void(Impl &)> task) noexcept
 {
     boost::asio::post(m_taskStrand,
                       [weak = make_weak_noexcept(shared_from_this()),
@@ -465,9 +467,9 @@ void CTcpClient::Impl::postTask(std::function<void(Impl&)> task) noexcept
 ** 与 server 的 startPool 逻辑对齐，消除重复的 tempThreads/threadFailed 逻辑。
 ** ───────────────────────────────────────────────────────────────────────── */
 bool CTcpClient::Impl::initializeContext(size_t threadCount,
-                                         boost::asio::io_context& context,
-                                         WorkGuardPtr& workGuard,
-                                         Threads& threads) noexcept
+                                         boost::asio::io_context &context,
+                                         WorkGuardPtr &workGuard,
+                                         Threads &threads) noexcept
 {
     // ① work_guard 必须在线程启动前持有，否则 context.run() 可能立即返回
     workGuard = make_unique_noexcept<WorkGuard>(boost::asio::make_work_guard(context));
@@ -483,14 +485,14 @@ bool CTcpClient::Impl::initializeContext(size_t threadCount,
             threads.emplace_back([this, &context] {
                 try {
                     context.run(); // 阻塞，直到 work_guard 释放且任务耗尽
-                } catch (const std::exception& ex) {
+                } catch (const std::exception &ex) {
                     reportError("线程异常: " + std::string(ex.what()));
                 } catch (...) {
                     reportError("线程发生未知异常");
                 }
             });
         }
-    } catch (const std::exception& ex) {
+    } catch (const std::exception &ex) {
         reportError("启动线程失败: " + std::string(ex.what()));
         return false;
     }
