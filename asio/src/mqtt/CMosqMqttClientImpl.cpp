@@ -1,7 +1,6 @@
 #include "CMosqMqttClientImpl.h"
 #include "utils/CAtomicUtil.h"
 #include <cassert>
-#include <thread>
 
 namespace {
 
@@ -150,11 +149,8 @@ void CMosqMqttClient::Impl::disconnect() noexcept
         return; // 已经断开连接，无需重复断开
     }
 
-    // 发送断开连接请求
+    // 发送断开连接请求，loop_stop(true) 会阻塞等待回调完成
     mosqpp::mosquittopp::disconnect();
-    // 等待一段时间，确保断开连接请求被处理
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    // 停止网络循环，等待 on_disconnect_v5 回调确认断开结果
     loop_stop(true);
 }
 
@@ -191,8 +187,8 @@ bool CMosqMqttClient::Impl::publish(
         return false;
     }
 
-    // 获取唯一的消息ID
-    int mid = CAtomicUtil::exchange(MID_COUNTER, MID_COUNTER + 1);
+    // 获取唯一的消息ID（fetch_add 避免 exchange 的竞态窗口）
+    int mid = CAtomicUtil::fetchAdd(MID_COUNTER, 1);
     if (mosqpp::mosquittopp::publish(&mid,
                                      topic.c_str(),
                                      static_cast<int>(payloadlen),

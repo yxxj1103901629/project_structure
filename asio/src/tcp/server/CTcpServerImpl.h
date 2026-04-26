@@ -1,10 +1,11 @@
 #pragma once
 
-#include "../include/tcp/CTcpServer.h"
+#include "tcp/CTcpServer.h"
 #include "CTcpSession.h"
 
 #include <boost/asio.hpp>
 #include <memory>
+#include "utils/AsioThreadPool.h"
 
 namespace asio {
 
@@ -48,9 +49,7 @@ enum class ServerState : uint8_t {
 class CTcpServer::Impl : public std::enable_shared_from_this<CTcpServer::Impl>,
                          public ISessionObserver
 {
-    using WorkGuard = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
-    using WorkGuardPtr = std::unique_ptr<WorkGuard>;
-    using Threads = std::vector<std::thread>;
+    using Threads = ThreadGroup;
     using SessionMap = std::unordered_map<NetAddr, std::shared_ptr<CTcpSession>>;
 
 public:
@@ -176,7 +175,7 @@ private:
      *
      * @param[in] msg 错误描述字符串。
      */
-    void notifyError(const std::string& msg) noexcept;
+    void notifyError(std::string msg) noexcept;
 
     /**
      * @name ISessionObserver 实现

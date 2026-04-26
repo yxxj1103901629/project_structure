@@ -236,12 +236,12 @@ void CTcpClient::Impl::doConnect() noexcept
     try {
         // ③ 解析目标地址
         error_code ec;
-        auto addr = make_address(m_connectTarget.ip(), ec);
+        auto addr = make_address(m_connectTarget.ip, ec);
         if (ec) {
             reportError("地址解析失败: " + ec.message());
             return;
         }
-        tcp::endpoint endpoint(addr, m_connectTarget.port());
+        tcp::endpoint endpoint(addr, m_connectTarget.port);
 
         // ④ 重建 socket，确保之前的连接资源已释放
         m_socket = tcp::socket(m_ioContext);
@@ -332,10 +332,11 @@ void CTcpClient::Impl::doRead() noexcept
     if (CAtomicUtil::load(m_connectionState) != ClientState::Connected)
         return;
 
-    auto self = shared_from_this();
+    auto weak = make_weak_noexcept(shared_from_this());
     m_socket.async_read_some(boost::asio::buffer(m_readBuffer),
-                             bind_executor(m_ioStrand, [self](error_code ec, size_t len) {
-                                 self->onRead(ec, len);
+                             bind_executor(m_ioStrand, [weak](error_code ec, size_t len) {
+                                 if (auto self = weak.lock())
+                                     self->onRead(ec, len);
                              }));
 }
 
@@ -385,11 +386,12 @@ void CTcpClient::Impl::doWrite() noexcept
 
     // async_write 的 error_code 重载不抛异常，m_isWriting 保持 true 直到 onWrite
     // 回调
-    auto self = shared_from_this();
+    auto weak = make_weak_noexcept(shared_from_this());
     boost::asio::async_write(m_socket,
                              m_batchViews,
-                             bind_executor(m_ioStrand, [self](error_code ec, size_t len) {
-                                 self->onWrite(ec, len);
+                             bind_executor(m_ioStrand, [weak](error_code ec, size_t len) {
+                                 if (auto self = weak.lock())
+                                     self->onWrite(ec, len);
                              }));
 }
 
@@ -432,9 +434,9 @@ void CTcpClient::Impl::reportMessageReceived(const char *data, size_t length) no
     });
 }
 
-void CTcpClient::Impl::reportError(const std::string &msg) noexcept
+void CTcpClient::Impl::reportError(std::string msg) noexcept
 {
-    postTask([msg](Impl &self) {
+    postTask([msg = std::move(msg)](Impl &self) {
         if (self.m_callback.errorOccurred)
             self.m_callback.errorOccurred(msg);
     });
@@ -471,33 +473,11 @@ bool CTcpClient::Impl::initializeContext(size_t threadCount,
                                          WorkGuardPtr &workGuard,
                                          Threads &threads) noexcept
 {
-    // ① work_guard 必须在线程启动前持有，否则 context.run() 可能立即返回
-    workGuard = make_unique_noexcept<WorkGuard>(boost::asio::make_work_guard(context));
-    if (!workGuard) {
-        reportError("创建工作保护失败");
-        return false;
-    }
-
-    // ② 批量创建工作线程；捕获 &context 保证引用同一 context
-    try {
-        threads.reserve(threadCount);
-        for (size_t i = 0; i < threadCount; ++i) {
-            threads.emplace_back([this, &context] {
-                try {
-                    context.run(); // 阻塞，直到 work_guard 释放且任务耗尽
-                } catch (const std::exception &ex) {
-                    reportError("线程异常: " + std::string(ex.what()));
-                } catch (...) {
-                    reportError("线程发生未知异常");
-                }
-            });
-        }
-    } catch (const std::exception &ex) {
-        reportError("启动线程失败: " + std::string(ex.what()));
-        return false;
-    }
-
-    return true;
+    return startAsioThreadPool(threadCount,
+                               context,
+                               workGuard,
+                               threads,
+                               [this](const std::string &msg) { reportError(msg); });
 }
 
 } // namespace asio

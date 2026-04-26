@@ -117,32 +117,8 @@ bool CTcpServer::Impl::listen(uint16_t port) noexcept {
 
 bool CTcpServer::Impl::startPool(size_t n, boost::asio::io_context &ctx,
                                  WorkGuardPtr &wg, Threads &pool) noexcept {
-  // ① work_guard 必须在线程启动前持有，否则 context.run() 可能立即返回
-  wg = make_unique_noexcept<WorkGuard>(make_work_guard(ctx));
-  if (!wg) {
-    notifyError("work guard alloc failed");
-    return false;
-  }
-
-  // ② 批量创建工作线程；捕获 &ctx 而非 this 拷贝，保证引用同一 context
-  try {
-    pool.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-      pool.emplace_back([this, &ctx] {
-        try {
-          ctx.run(); // 阻塞，直到 work_guard 释放且任务耗尽
-        } catch (const std::exception &e) {
-          notifyError(e.what());
-        } catch (...) {
-          notifyError("unknown thread exception");
-        }
-      });
-    }
-  } catch (const std::exception &e) {
-    notifyError(e.what());
-    return false;
-  }
-  return true;
+  return startAsioThreadPool(n, ctx, wg, pool,
+                             [this](const std::string &msg) { notifyError(msg); });
 }
 
 /* ─────────────────────────────────────────────────────────────────────────
@@ -230,7 +206,7 @@ bool CTcpServer::Impl::send2c(const NetAddr &clientAddr,
   auto session = getSession(clientAddr);
   if (!session)
     return false;
-  session->send(std::string(data));
+  session->send(data);
   return true;
 }
 
@@ -244,7 +220,7 @@ bool CTcpServer::Impl::broadcast(std::string_view data) noexcept {
       snapshot.push_back(kv.second);
   }
   for (auto &s : snapshot)
-    s->send(std::string(data));
+    s->send(data);
   return true;
 }
 
@@ -348,8 +324,8 @@ CTcpServer::Impl::getSession(const NetAddr &addr) const noexcept {
 ** ───────────────────────────────────────────────────────────────────────── */
 
 /* 所有错误（来自 session 或 Impl 自身）统一经此入队，在任务线程触发用户回调。*/
-void CTcpServer::Impl::notifyError(const std::string &msg) noexcept {
-  postTask([msg](Impl &self) {
+void CTcpServer::Impl::notifyError(std::string msg) noexcept {
+  postTask([msg = std::move(msg)](Impl &self) {
     if (self.m_callback.errorOccurred)
       self.m_callback.errorOccurred(msg);
   });

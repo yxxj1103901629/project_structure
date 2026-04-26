@@ -1,4 +1,4 @@
-#include "../include/mqtt/CMosqMqttClient.h"
+#include "mqtt/CMosqMqttClient.h"
 #include "CMosqMqttClientImpl.h"
 #include "utils/MakeHelper.h"
 #include <cassert>

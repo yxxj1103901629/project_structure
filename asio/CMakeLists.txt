@@ -6,15 +6,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ==================== 路径配置 ====================
-# 设置输出目录
 set(BIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/bin)
-
-# 设置构建类型(用于确定第三方库的debug/release版本)
-if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    set(BUILD_TYPE "debug")
-else()
-    set(BUILD_TYPE "release")
-endif()
 
 # 设置第三方库的相关路径
 set(THIRD_PARTY_INCLUDE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/include)
@@ -58,7 +50,6 @@ file(GLOB_RECURSE SRC_FILES "src/*")
 add_library(${PROJECT_NAME} SHARED ${SRC_FILES})
 
 # ==================== 库属性配置 ====================
-# 设置输出目录和导出配置
 set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_DEBUG ${BIN_DIR}/debug
     ARCHIVE_OUTPUT_DIRECTORY_DEBUG ${BIN_DIR}/debug
@@ -73,12 +64,11 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 )
 
 # ==================== 头文件配置 ====================
-# 只暴露 include 目录中的公共头文件给用户
-target_include_directories(${PROJECT_NAME} 
-    PUBLIC 
+target_include_directories(${PROJECT_NAME}
+    PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
-    PRIVATE 
+    PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${THIRD_PARTY_INCLUDE}
         ${THIRD_PARTY_INCLUDE}/mosquitto-2.1.2
@@ -91,33 +81,30 @@ target_compile_definitions(${PROJECT_NAME}
 )
 
 # ==================== 链接配置 ====================
-target_link_directories(${PROJECT_NAME} PRIVATE 
-    ${THIRD_PARTY_LIB}/mosquitto-2.1.2/${BUILD_TYPE}
+# 使用 $<CONFIG> 生成器表达式兼容多配置生成器（如 Visual Studio）
+set(MOSQ_LIB_DIR ${THIRD_PARTY_LIB}/mosquitto-2.1.2)
+target_link_directories(${PROJECT_NAME} PRIVATE
+    ${MOSQ_LIB_DIR}/$<IF:$<CONFIG:Debug>,debug,release>
 )
 
-target_link_libraries(${PROJECT_NAME} 
+target_link_libraries(${PROJECT_NAME}
     PRIVATE
     mosquittopp
 )
 
 # ==================== 后期构建操作 ====================
-# 复制第三方库的DLL文件到输出目录
-function(copy_dll_files DLL_DIRs)
-    foreach(DLL_DIR ${DLL_DIRs})
-        file(GLOB DLL_FILES ${DLL_DIR}/*.dll)
-        foreach(DLL_FILE ${DLL_FILES})
-            add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
-                COMMAND ${CMAKE_COMMAND} -E copy_if_different ${DLL_FILE} ${BIN_DIR}/${BUILD_TYPE}
-            )
-        endforeach()
-    endforeach()
-endfunction()
-
-# 复制mosquitto的DLL文件到输出目录
-copy_dll_files(${THIRD_PARTY_BIN}/mosquitto-2.1.2/${BUILD_TYPE})
+# 复制 mosquitto DLL 到输出目录（使用 $<CONFIG> 按配置选择目录）
+set(MOSQ_BIN_SUBDIR ${THIRD_PARTY_BIN}/mosquitto-2.1.2)
+add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${MOSQ_BIN_SUBDIR}/$<CONFIG>/mosquitto.dll"
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${MOSQ_BIN_SUBDIR}/$<CONFIG>/mosquittopp.dll"
+        $<TARGET_FILE_DIR:${PROJECT_NAME}>
+    COMMENT "Copying mosquitto DLLs to output directory"
+)
 
 # ==================== 测试配置 ====================
-if(BUILD_TYPE STREQUAL "debug")
-    enable_testing()
-    add_subdirectory(tests)
-endif()
+enable_testing()
+add_subdirectory(tests)

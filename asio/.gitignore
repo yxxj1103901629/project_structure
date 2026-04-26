@@ -3,6 +3,7 @@
 build/
 bin/
 .vscode/
+.claude/
 third_party/lib/
 third_party/bin/
 

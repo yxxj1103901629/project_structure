@@ -1,4 +1,4 @@
-#include "../include/tcp/CTcpServer.h"
+#include "tcp/CTcpServer.h"
 #include "CTcpServerImpl.h"
 #include "utils/MakeHelper.h"
 

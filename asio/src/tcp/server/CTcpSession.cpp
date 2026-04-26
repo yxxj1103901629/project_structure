@@ -49,6 +49,27 @@ bool CTcpSession::start() noexcept
     return true;
 }
 
+void CTcpSession::send(std::string_view data) noexcept
+{
+    if (data.empty()) {
+        return; // 不发送空消息
+    }
+
+    if (!CAtomicUtil::load(m_isConnected)) {
+        return; // 连接已关闭，无法发送
+    }
+
+    m_msgQueue.enqueue(std::string(data)); // 拷贝入队
+
+    dispatch(m_writeStrand, [weak = make_weak_noexcept(shared_from_this())]() {
+        auto self = weak.lock();
+        // 如果当前没有正在发送的消息，启动发送流程
+        if (self && !CAtomicUtil::exchange(self->m_isWriting, true)) {
+            self->doWrite(); // 启动发送流程
+        }
+    });
+}
+
 void CTcpSession::send(std::string&& data) noexcept
 {
     if (data.empty()) {
@@ -61,7 +82,7 @@ void CTcpSession::send(std::string&& data) noexcept
 
     m_msgQueue.enqueue(std::move(data)); // 将消息添加到发送队列
 
-    post(m_writeStrand, [weak = make_weak_noexcept(shared_from_this())]() {
+    dispatch(m_writeStrand, [weak = make_weak_noexcept(shared_from_this())]() {
         auto self = weak.lock();
         // 如果当前没有正在发送的消息，启动发送流程
         if (self && !CAtomicUtil::exchange(self->m_isWriting, true)) {
@@ -77,7 +98,7 @@ void CTcpSession::close() noexcept
     }
 
     // 通过串行化执行器异步关闭连接，确保线程安全
-    post(m_writeStrand, [weak = make_weak_noexcept(shared_from_this())]() {
+    dispatch(m_writeStrand, [weak = make_weak_noexcept(shared_from_this())]() {
         auto self = weak.lock();
         if (!self)
             return;
@@ -94,11 +115,13 @@ void CTcpSession::doRead() noexcept
         return; // 连接已关闭，不再执行读取操作
     }
 
-    // 强指针捕获 self：m_readBuffer 是 async_read_some 的 DMA 目标，
-    // 回调触发前 buffer 必须持续有效；弱指针 lock 失败会导致 buffer 悬空（UB）。
-    auto self = shared_from_this();
-    // 定义读取完成后的回调函数，处理读取结果
-    auto onRead = [self](error_code ec, std::size_t len) {
+    // 弱指针捕获 self：socket.close() 取消 I/O 发生在 ~Impl/~CTcpSession 内，
+    // 回调执行时对象尚存，lock() 必定成功，buffer 安全。
+    auto weak = make_weak_noexcept(shared_from_this());
+    auto onRead = [weak](error_code ec, std::size_t len) {
+        auto self = weak.lock();
+        if (!self)
+            return;
         if (!ec && len > 0) { // 成功读取数据
             // 成功读取数据，触发消息回调并继续读取下一个数据包
             self->reportMessage(self->m_readBuffer.data(), len);
@@ -144,12 +167,14 @@ void CTcpSession::doWrite() noexcept
         m_sendBuffers.emplace_back(boost::asio::buffer(m_writeBuffer[i]));
     }
 
-    // 强指针捕获 self：m_writeBuffer / m_sendBuffers 是 async_write 的散列写 buffer，
-    // 回调触发前这些成员必须持续有效；弱指针 lock 失败会导致 buffer 悬空（UB）。
-    auto self = shared_from_this();
+    // 弱指针捕获：close() 取消写操作发生在对象析构内，回调时 buffer 有效
+    auto weak = make_weak_noexcept(shared_from_this());
     async_write(m_socket,
                 m_sendBuffers,
-                bind_executor(m_writeStrand, [self](error_code ec, std::size_t) {
+                bind_executor(m_writeStrand, [weak](error_code ec, std::size_t) {
+                    auto self = weak.lock();
+                    if (!self)
+                        return;
                     if (ec) {
                         CAtomicUtil::store(self->m_isWriting, false);
                         self->reportError("发送数据失败: " + ec.message());

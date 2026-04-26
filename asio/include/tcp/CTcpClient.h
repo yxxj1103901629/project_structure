@@ -1,6 +1,7 @@
 #pragma once
 
-#include "NetDefs.h"
+#include "NetAddr.h"
+#include <functional>
 #include <memory>
 
 #ifdef NETWORK_EXPORTS
@@ -10,6 +11,19 @@
 #endif
 
 namespace asio {
+
+/** 客户端回调结构体 */
+struct ClientCallback
+{
+    using AddrCb = std::function<void(const NetAddr &)>;
+    using MsgCb = std::function<void(std::string_view)>;
+    using ErrorCb = std::function<void(const std::string &)>;
+
+    AddrCb connected = nullptr;
+    AddrCb disconnected = nullptr;
+    MsgCb messageReceived = nullptr;
+    ErrorCb errorOccurred = nullptr;
+};
 
 /**
  * @brief TCP 客户端门面（Facade + Pimpl）。

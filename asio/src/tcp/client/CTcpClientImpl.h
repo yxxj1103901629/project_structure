@@ -5,6 +5,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/strand.hpp>
 #include <concurrentqueue-1.0.4/concurrentqueue.h>
+#include "utils/AsioThreadPool.h"
 
 namespace {
 
@@ -50,9 +51,7 @@ class CTcpClient::Impl : public std::enable_shared_from_this<CTcpClient::Impl>
 {
     ///< Socket 相关操作执行器，保证连接/读写状态机串行推进
     using Strand = boost::asio::strand<boost::asio::io_context::executor_type>;
-    using WorkGuard = boost::asio::executor_work_guard<boost::asio::io_context::executor_type>;
-    using WorkGuardPtr = std::unique_ptr<WorkGuard>;
-    using Threads = std::vector<std::thread>;
+    using Threads = ThreadGroup;
 
 public:
     /**
@@ -146,7 +145,7 @@ private:
     void reportConnected() noexcept;
     void reportDisconnected() noexcept;
     void reportMessageReceived(const char* data, size_t length) noexcept;
-    void reportError(const std::string& msg) noexcept;
+    void reportError(std::string msg) noexcept;
     /** @} */
 
     /**

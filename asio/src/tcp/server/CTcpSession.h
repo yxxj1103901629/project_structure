@@ -40,6 +40,7 @@ public:
 
     bool start() noexcept;
 
+    void send(std::string_view data) noexcept;
     void send(std::string&& data) noexcept;
 
     void close() noexcept;

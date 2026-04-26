@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../include/mqtt/CMosqMqttClient.h"
+#include "mqtt/CMosqMqttClient.h"
 #include <atomic>
 #include <mosquitto/libmosquittopp.h>
 

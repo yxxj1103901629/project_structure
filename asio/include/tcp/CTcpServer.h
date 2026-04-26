@@ -1,6 +1,7 @@
 #pragma once
 
-#include "NetDefs.h"
+#include "NetAddr.h"
+#include <functional>
 #include <memory>
 
 #ifdef NETWORK_EXPORTS
@@ -10,6 +11,19 @@
 #endif
 
 namespace asio {
+
+/** 服务器回调结构体 */
+struct ServerCallback
+{
+    using AddrCb = std::function<void(const NetAddr &)>;
+    using MsgCb = std::function<void(const NetAddr &, std::string_view)>;
+    using ErrorCb = std::function<void(const std::string &)>;
+
+    AddrCb clientConnected = nullptr;
+    AddrCb clientDisconnected = nullptr;
+    MsgCb messageReceived = nullptr;
+    ErrorCb errorOccurred = nullptr;
+};
 
 class CTCP_SERVER_API CTcpServer
 {

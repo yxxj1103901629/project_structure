@@ -1,7 +1,8 @@
 #pragma once
 
-#include "NetDefs.h"
+#include <functional>
 #include <memory>
+#include <string>
 
 #ifdef NETWORK_EXPORTS
 #define CMOSQ_MQTT_CLIENT_API __declspec(dllexport)
@@ -9,14 +10,35 @@
 #define CMOSQ_MQTT_CLIENT_API __declspec(dllimport)
 #endif
 
-/**
- * @file CMosqMqttClient.h
- * @brief 基于 mosquitto 库的 MQTT 客户端封装类
- * @details 该类封装了 mosquitto 库的 MQTT 客户端功能，提供了一个简单易用的接口用于连接到 MQTT 代理、发布消息、订阅主题等操作。
- *          内部使用 Pimpl 设计模式隐藏实现细节，确保接口的稳定性和易用性。
- */
-
 namespace mosq {
+
+struct Config
+{
+    std::string brokerAddress;
+    uint16_t brokerPort{1883};
+    std::string clientId = "";
+    std::string username = "";
+    std::string password = "";
+};
+
+struct ClientCallback
+{
+    using ConnectedCb = std::function<void()>;
+    using DisconnectedCb = std::function<void()>;
+    using MessageReceivedCb = std::function<void(const std::string &, std::string_view)>;
+    using PublishedCb = std::function<void(int)>;
+    using SubscribedCb = std::function<void(int, int)>;
+    using UnsubscribedCb = std::function<void(int)>;
+    using ErrorCb = std::function<void(const std::string &)>;
+
+    ConnectedCb connected = nullptr;
+    DisconnectedCb disconnected = nullptr;
+    MessageReceivedCb messageReceived = nullptr;
+    PublishedCb published = nullptr;
+    SubscribedCb subscribed = nullptr;
+    UnsubscribedCb unsubscribed = nullptr;
+    ErrorCb errorOccurred = nullptr;
+};
 
 class CMOSQ_MQTT_CLIENT_API CMosqMqttClient final
 {
