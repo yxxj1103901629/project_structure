@@ -1,16 +1,124 @@
 #include "CMosqMqttClientImpl.h"
 #include "utils/CAtomicUtil.h"
+
 #include <cassert>
+#include <cstdlib>
 
 namespace {
 
-int PROTOCOL_VERSION = MQTT_PROTOCOL_V5; // MQTT5 版本
+int PROTOCOL_VERSION = MQTT_PROTOCOL_V5;
+std::atomic<int> MID_COUNTER{1};
+std::atomic<int> MOSQ_LIB_USERS{0};
+std::mutex MOSQ_LIB_MUTEX;
+bool MOSQ_LIB_READY = false;
+std::mutex MQTT_TASK_MUTEX;
+std::unique_ptr<boost::asio::io_context> MQTT_TASK_CONTEXT;
+std::unique_ptr<asio::WorkGuard> MQTT_TASK_GUARD;
+std::unique_ptr<std::thread> MQTT_TASK_THREAD;
 
-std::atomic<int> MID_COUNTER{0}; // 消息ID计数器，确保每条消息有唯一ID
+constexpr size_t RECONNECT_INTERVAL_INIT_SEC = 5;
+constexpr size_t RECONNECT_INTERVAL_MAX_SEC = 30;
+constexpr size_t KEEP_ALIVE_INTERVAL_SEC = 60;
 
-constexpr size_t RECONNECT_INTERVAL_INIT_SEC = 5; // 初始重连间隔秒数
-constexpr size_t RECONNECT_INTERVAL_MAX_SEC = 30; // 最大重连间隔秒数
-constexpr size_t KEEP_ALIVE_INTERVAL_SEC = 60;    // 保持连接间隔秒数
+bool retainMosqLibrary() noexcept
+{
+    std::lock_guard lock(MOSQ_LIB_MUTEX);
+    if (!MOSQ_LIB_READY) {
+        if (mosqpp::lib_init() != MOSQ_ERR_SUCCESS) {
+            return false;
+        }
+        MOSQ_LIB_READY = true;
+    }
+    MOSQ_LIB_USERS.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+void releaseMosqLibrary() noexcept
+{
+    std::lock_guard lock(MOSQ_LIB_MUTEX);
+    (void)MOSQ_LIB_USERS.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+struct MosqLibraryProcessCleanup
+{
+    ~MosqLibraryProcessCleanup()
+    {
+        {
+            std::lock_guard lock(MQTT_TASK_MUTEX);
+            if (MQTT_TASK_GUARD) {
+                MQTT_TASK_GUARD.reset();
+            }
+            if (MQTT_TASK_CONTEXT) {
+                MQTT_TASK_CONTEXT->stop();
+            }
+        }
+        if (MQTT_TASK_THREAD && MQTT_TASK_THREAD->joinable()) {
+            MQTT_TASK_THREAD->join();
+        }
+        MQTT_TASK_THREAD.reset();
+        MQTT_TASK_CONTEXT.reset();
+
+        std::lock_guard lock(MOSQ_LIB_MUTEX);
+        if (MOSQ_LIB_READY) {
+            mosqpp::lib_cleanup();
+            MOSQ_LIB_READY = false;
+        }
+    }
+};
+
+MosqLibraryProcessCleanup MOSQ_LIB_PROCESS_CLEANUP;
+
+class MosqLibraryLease
+{
+public:
+    bool acquire() noexcept
+    {
+        if (m_acquired) {
+            return true;
+        }
+        m_acquired = retainMosqLibrary();
+        return m_acquired;
+    }
+
+    void release() noexcept
+    {
+        if (!m_acquired) {
+            return;
+        }
+        releaseMosqLibrary();
+        m_acquired = false;
+    }
+
+    ~MosqLibraryLease()
+    {
+        release();
+    }
+
+private:
+    bool m_acquired{false};
+};
+
+bool ensureMqttTaskDispatcher() noexcept
+{
+    std::lock_guard lock(MQTT_TASK_MUTEX);
+    if (MQTT_TASK_CONTEXT) {
+        return true;
+    }
+
+    auto context = std::make_unique<boost::asio::io_context>();
+    auto guard = std::make_unique<asio::WorkGuard>(boost::asio::make_work_guard(*context));
+    auto thread = std::make_unique<std::thread>([ctx = context.get()] {
+        try {
+            ctx->run();
+        } catch (...) {
+        }
+    });
+
+    MQTT_TASK_CONTEXT = std::move(context);
+    MQTT_TASK_GUARD = std::move(guard);
+    MQTT_TASK_THREAD = std::move(thread);
+    return true;
+}
 
 } // namespace
 
@@ -23,172 +131,160 @@ CMosqMqttClient::Impl::Impl()
 CMosqMqttClient::Impl::~Impl()
 {
     disconnect();
-    mosqpp::lib_cleanup(); // 清理 mosquitto 库资源
+    if (CAtomicUtil::exchange(m_initialized, false)) {
+        releaseMosqLibrary();
+    }
 }
 
-bool CMosqMqttClient::Impl::init(const Config &config) noexcept
+bool CMosqMqttClient::Impl::init(const Config& config) noexcept
 {
-    if (CAtomicUtil::load(m_initialized)) {
-        return false; // 已经初始化，防止重复初始化导致状态混乱
+    bool expected = false;
+    if (!m_initialized.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return false;
     }
 
+    struct Guard
+    {
+        Impl* self;
+        bool ok{false};
+        MosqLibraryLease libraryLease;
+        ~Guard()
+        {
+            if (!ok) {
+                CAtomicUtil::store(self->m_initialized, false);
+            }
+        }
+        void release() noexcept { ok = true; }
+    } guard{this};
+
+    if (!guard.libraryLease.acquire()) {
+        return false;
+    }
+
+    if (!ensureMqttTaskDispatcher()) {
+        return false;
+    }
     m_brokerAddress = config.brokerAddress;
     if (m_brokerAddress.empty()) {
-        assert(false && "代理地址不能为空");
         return false;
-    }
-    m_brokerPort = config.brokerPort;
-    if (m_brokerPort == 0) {
-        assert(false && "代理端口必须大于0");
-        return false;
-    }
-    m_clientId = config.clientId;
-    if (m_clientId.empty()) {
-        // 生成随机客户端ID，避免与其他客户端冲突
-        m_clientId = "mosq_client_" + std::to_string(std::rand());
     }
 
+    m_brokerPort = config.brokerPort;
+    if (m_brokerPort == 0) {
+        return false;
+    }
+
+    m_clientId = config.clientId.empty() ? "mosq_client_" + std::to_string(std::rand()) : config.clientId;
     m_username = config.username;
     m_password = config.password;
 
-    // 设置 MQTT 协议版本为 MQTT5
     if (opts_set(MOSQ_OPT_PROTOCOL_VERSION, &PROTOCOL_VERSION) != MOSQ_ERR_SUCCESS) {
-        assert(false && "设置 MQTT 协议版本失败");
         return false;
     }
 
-    // 初始化 mosquitto 库资源
-    if (mosqpp::lib_init() != MOSQ_ERR_SUCCESS) {
-        assert(false && "初始化 mosquitto 库失败");
-        return false;
-    }
-
-    CAtomicUtil::store(m_initialized, true);
+    guard.libraryLease.release();
+    guard.release();
     return true;
 }
 
 bool CMosqMqttClient::Impl::connect() noexcept
 {
     if (!CAtomicUtil::load(m_initialized)) {
-        reportError("客户端未初始化");
+        reportError("mqtt client is not initialized");
         return false;
     }
 
-    if (m_state != State::DISCONNECTED) {
-        reportError("客户端已连接或正在连接中");
+    State expected = State::Disconnected;
+    if (!m_state.compare_exchange_strong(expected, State::Connecting, std::memory_order_acq_rel)) {
+        reportError("mqtt client is already connecting or connected");
         return false;
     }
 
     struct Guard
     {
-        Impl *self;
-        bool ok = false;
-        Guard(Impl *impl)
-            : self(impl)
-        {
-            // 在构造函数中设置状态为 CONNECTING，确保在连接过程中状态正确
-            CAtomicUtil::store(self->m_state, State::CONNECTING);
-        }
-        ~Guard() noexcept
+        Impl* self;
+        bool ok{false};
+        ~Guard()
         {
             if (!ok) {
-                // 如果连接失败，重置状态为 DISCONNECTED
-                CAtomicUtil::store(self->m_state, State::DISCONNECTED);
+                CAtomicUtil::store(self->m_state, State::Disconnected);
             }
         }
         void release() noexcept { ok = true; }
-    } gurad{this};
+    } guard{this};
 
-    // 设置客户端ID并清理会话
     if (reinitialise(m_clientId.c_str(), true) != MOSQ_ERR_SUCCESS) {
-        reportError("设置客户端ID失败");
+        reportError("failed to reinitialize mosquitto client");
         return false;
     }
 
-    // 设置用户名密码
     if (!m_username.empty()) {
-        const auto &password = m_password.empty() ? nullptr : m_password.c_str();
+        const char* password = m_password.empty() ? nullptr : m_password.c_str();
         if (username_pw_set(m_username.c_str(), password) != MOSQ_ERR_SUCCESS) {
-            reportError("设置用户名密码失败");
+            reportError("failed to set mqtt credentials");
             return false;
         }
     }
 
-    // 设置重连间隔
-    reconnect_delay_set(RECONNECT_INTERVAL_INIT_SEC, // 最小重连间隔秒数
-                        RECONNECT_INTERVAL_MAX_SEC,  // 最大重连间隔秒数
-                        true                         // 启用指数退避
-    );
+    reconnect_delay_set(RECONNECT_INTERVAL_INIT_SEC, RECONNECT_INTERVAL_MAX_SEC, true);
 
-    // 异步连接到代理
-    int ret = connect_async(m_brokerAddress.c_str(), m_brokerPort, KEEP_ALIVE_INTERVAL_SEC);
-    if (ret != MOSQ_ERR_SUCCESS) {
-        reportError("连接到代理失败: " + std::to_string(ret));
+    const int connectResult = connect_async(m_brokerAddress.c_str(), m_brokerPort, KEEP_ALIVE_INTERVAL_SEC);
+    if (connectResult != MOSQ_ERR_SUCCESS) {
+        reportError("failed to start async mqtt connect: " + std::to_string(connectResult));
         return false;
     }
 
-    // 启用网络循环
-    if (loop_start() != MOSQ_ERR_SUCCESS) {
-        reportError("启动网络循环失败");
+    const int loopResult = loop_start();
+    if (loopResult != MOSQ_ERR_SUCCESS) {
+        reportError("failed to start mqtt network loop");
         return false;
     }
+    CAtomicUtil::store(m_loopStarted, true);
 
-    // 流程到这里说明连接请求已成功发出，等待 on_connect_v5 回调确认连接结果
-    gurad.release();
-
+    guard.release();
     return true;
 }
 
 void CMosqMqttClient::Impl::disconnect() noexcept
 {
     if (!CAtomicUtil::load(m_initialized)) {
-        return; // 未初始化，无需断开连接
+        return;
     }
 
-    if (CAtomicUtil::load(m_state) == State::DISCONNECTED) {
-        return; // 已经断开连接，无需重复断开
+    const auto previousState = CAtomicUtil::exchange(m_state, State::Disconnected);
+    if (previousState != State::Disconnected) {
+        mosqpp::mosquittopp::disconnect();
     }
 
-    // 发送断开连接请求，loop_stop(true) 会阻塞等待回调完成
-    mosqpp::mosquittopp::disconnect();
-    loop_stop(true);
+    if (CAtomicUtil::exchange(m_loopStarted, false)) {
+        loop_stop(true);
+    }
 }
 
-bool CMosqMqttClient::Impl::publish(
-    const std::string &topic, const char *payload, size_t payloadlen, int qos, bool retain) noexcept
+bool CMosqMqttClient::Impl::publish(const std::string& topic,
+                                    const char* payload,
+                                    size_t payloadlen,
+                                    int qos,
+                                    bool retain) noexcept
 {
-    if (topic.empty()) {
-        reportError("发布失败: 主题不能为空");
+    if (topic.empty() || payload == nullptr || payloadlen == 0 || payloadlen > 268435455) {
+        reportError("publish rejected due to invalid topic or payload");
         return false;
     }
-
     if (qos < 0 || qos > 2) {
-        reportError("发布失败: QoS必须为0、1或2");
+        reportError("publish rejected due to invalid qos");
         return false;
     }
-
-    if (payload == nullptr) {
-        reportError("发布失败: 有效载荷不能为空");
-        return false;
-    }
-
-    if (payloadlen > 268435455 || payloadlen == 0) { // MQTT协议规定的最大有效载荷长度
-        reportError("发布失败: 有效载荷过大或为空");
-        return false;
-    }
-
     if (!CAtomicUtil::load(m_initialized)) {
-        reportError("客户端未初始化");
+        reportError("mqtt client is not initialized");
+        return false;
+    }
+    if (CAtomicUtil::load(m_state) != State::Connected) {
+        reportError("mqtt client is not connected");
         return false;
     }
 
-    if (CAtomicUtil::load(m_state) != State::CONNECTED) {
-        reportError("客户端未连接");
-        return false;
-    }
-
-    // 获取唯一的消息ID（fetch_add 避免 exchange 的竞态窗口）
-    int mid = CAtomicUtil::fetchAdd(MID_COUNTER, 1);
+    int mid = MID_COUNTER.fetch_add(1, std::memory_order_relaxed);
     if (mosqpp::mosquittopp::publish(&mid,
                                      topic.c_str(),
                                      static_cast<int>(payloadlen),
@@ -196,197 +292,225 @@ bool CMosqMqttClient::Impl::publish(
                                      qos,
                                      retain)
         != MOSQ_ERR_SUCCESS) {
-        reportError("发布消息到主题" + topic + "失败");
+        reportError("failed to publish topic: " + topic);
         return false;
     }
 
     return true;
 }
 
-bool CMosqMqttClient::Impl::subscribe(const std::string &topic, int qos) noexcept
+bool CMosqMqttClient::Impl::subscribe(const std::string& topic, int qos) noexcept
 {
     if (topic.empty()) {
-        reportError("订阅失败: 主题不能为空");
+        reportError("subscribe rejected due to empty topic");
         return false;
     }
-
     if (qos < 0 || qos > 2) {
-        reportError("订阅失败: QoS必须为0、1或2");
+        reportError("subscribe rejected due to invalid qos");
         return false;
     }
-
     if (!CAtomicUtil::load(m_initialized)) {
-        reportError("客户端未初始化");
+        reportError("mqtt client is not initialized");
         return false;
     }
-
-    if (CAtomicUtil::load(m_state) != State::CONNECTED) {
-        reportError("客户端未连接");
+    if (CAtomicUtil::load(m_state) != State::Connected) {
+        reportError("mqtt client is not connected");
         return false;
     }
 
     if (mosqpp::mosquittopp::subscribe(nullptr, topic.c_str(), qos) != MOSQ_ERR_SUCCESS) {
-        reportError("订阅主题" + topic + "失败");
+        reportError("failed to subscribe topic: " + topic);
         return false;
     }
 
     return true;
 }
 
-bool CMosqMqttClient::Impl::unsubscribe(const std::string &topic) noexcept
+bool CMosqMqttClient::Impl::unsubscribe(const std::string& topic) noexcept
 {
     if (topic.empty()) {
-        reportError("取消订阅失败: 主题不能为空");
+        reportError("unsubscribe rejected due to empty topic");
         return false;
     }
-
     if (!CAtomicUtil::load(m_initialized)) {
-        reportError("客户端未初始化");
+        reportError("mqtt client is not initialized");
         return false;
     }
-
-    if (CAtomicUtil::load(m_state) != State::CONNECTED) {
-        reportError("客户端未连接");
+    if (CAtomicUtil::load(m_state) != State::Connected) {
+        reportError("mqtt client is not connected");
         return false;
     }
 
     if (mosqpp::mosquittopp::unsubscribe(nullptr, topic.c_str()) != MOSQ_ERR_SUCCESS) {
-        reportError("取消订阅主题" + topic + "失败");
+        reportError("failed to unsubscribe topic: " + topic);
         return false;
     }
 
     return true;
 }
 
-void CMosqMqttClient::Impl::setCallback(const ClientCallback &callback) noexcept
+void CMosqMqttClient::Impl::setCallback(const ClientCallback& callback) noexcept
 {
+    std::lock_guard lock(m_callbackMutex);
     m_callback = callback;
 }
 
-void CMosqMqttClient::Impl::setCallback(ClientCallback &&callback) noexcept
+void CMosqMqttClient::Impl::setCallback(ClientCallback&& callback) noexcept
 {
+    std::lock_guard lock(m_callbackMutex);
     m_callback = std::move(callback);
 }
 
-void CMosqMqttClient::Impl::reportError(const std::string &msg) noexcept
+void CMosqMqttClient::Impl::reportError(const std::string& msg) noexcept
 {
-    if (m_callback.errorOccurred) {
-        m_callback.errorOccurred(msg);
-    }
+    postTask([msg](Impl& self) {
+        const auto callback = self.copyCallback();
+        if (callback.errorOccurred) {
+            callback.errorOccurred(msg);
+        }
+    });
 }
 
 void CMosqMqttClient::Impl::reportConnected() noexcept
 {
-    if (m_callback.connected) {
-        m_callback.connected();
-    }
+    postTask([](Impl& self) {
+        const auto callback = self.copyCallback();
+        if (callback.connected) {
+            callback.connected();
+        }
+    });
 }
 
 void CMosqMqttClient::Impl::reportDisconnected() noexcept
 {
-    if (m_callback.disconnected) {
-        m_callback.disconnected();
-    }
+    postTask([](Impl& self) {
+        const auto callback = self.copyCallback();
+        if (callback.disconnected) {
+            callback.disconnected();
+        }
+    });
 }
 
-void CMosqMqttClient::Impl::reportMessageReceived(const std::string &topic,
-                                                  std::string_view payload) noexcept
+void CMosqMqttClient::Impl::reportMessageReceived(const std::string& topic, std::string payload) noexcept
 {
-    if (m_callback.messageReceived) {
-        m_callback.messageReceived(topic, payload);
-    }
+    postTask([topic, payload = std::move(payload)](Impl& self) {
+        const auto callback = self.copyCallback();
+        if (callback.messageReceived) {
+            callback.messageReceived(topic, std::string_view(payload));
+        }
+    });
 }
 
 void CMosqMqttClient::Impl::reportSubscribed(int mid, int qos) noexcept
 {
-    if (m_callback.subscribed) {
-        m_callback.subscribed(mid, qos);
-    }
+    postTask([mid, qos](Impl& self) {
+        const auto callback = self.copyCallback();
+        if (callback.subscribed) {
+            callback.subscribed(mid, qos);
+        }
+    });
 }
 
 void CMosqMqttClient::Impl::reportUnsubscribed(int mid) noexcept
 {
-    if (m_callback.unsubscribed) {
-        m_callback.unsubscribed(mid);
-    }
+    postTask([mid](Impl& self) {
+        const auto callback = self.copyCallback();
+        if (callback.unsubscribed) {
+            callback.unsubscribed(mid);
+        }
+    });
 }
 
 void CMosqMqttClient::Impl::reportPublished(int mid) noexcept
 {
-    if (m_callback.published) {
-        m_callback.published(mid);
-    }
+    postTask([mid](Impl& self) {
+        const auto callback = self.copyCallback();
+        if (callback.published) {
+            callback.published(mid);
+        }
+    });
 }
 
-void CMosqMqttClient::Impl::on_connect_v5(int rc,
-                                          int flags,
-                                          const mosquitto_property *props) noexcept
+ClientCallback CMosqMqttClient::Impl::copyCallback() const noexcept
+{
+    std::lock_guard lock(m_callbackMutex);
+    return m_callback;
+}
+
+void CMosqMqttClient::Impl::postTask(std::function<void(Impl&)> task) noexcept
+{
+    std::lock_guard lock(MQTT_TASK_MUTEX);
+    if (!MQTT_TASK_CONTEXT) {
+        return;
+    }
+    boost::asio::post(*MQTT_TASK_CONTEXT, [this, task = std::move(task)]() mutable { task(*this); });
+}
+
+void CMosqMqttClient::Impl::on_connect_v5(int rc, int, const mosquitto_property*) noexcept
 {
     if (rc == 0) {
-        CAtomicUtil::store(m_state, State::CONNECTED);
+        CAtomicUtil::store(m_state, State::Connected);
         reportConnected();
     } else {
-        CAtomicUtil::store(m_state, State::DISCONNECTED);
-        reportError("连接失败，错误代码: " + std::to_string(rc));
+        CAtomicUtil::store(m_state, State::Disconnected);
+        reportError("mqtt connect failed, rc=" + std::to_string(rc));
     }
 }
 
-void CMosqMqttClient::Impl::on_disconnect_v5(int rc, const mosquitto_property *props) noexcept
+void CMosqMqttClient::Impl::on_disconnect_v5(int rc, const mosquitto_property*) noexcept
 {
-    CAtomicUtil::store(m_state, State::DISCONNECTED);
+    CAtomicUtil::store(m_state, State::Disconnected);
     if (rc == 0) {
         reportDisconnected();
     } else {
-        reportError("意外断开连接，错误代码: " + std::to_string(rc));
+        reportError("mqtt disconnected unexpectedly, rc=" + std::to_string(rc));
     }
 }
 
-void CMosqMqttClient::Impl::on_message_v5(const struct mosquitto_message *message,
-                                          const mosquitto_property *props) noexcept
+void CMosqMqttClient::Impl::on_message_v5(const struct mosquitto_message* message,
+                                          const mosquitto_property*) noexcept
 {
     if (message == nullptr || message->topic == nullptr || message->payload == nullptr) {
-        reportError("接收到无效消息");
+        reportError("received invalid mqtt message");
         return;
     }
 
     std::string topic(message->topic);
-    std::string_view payload(static_cast<const char *>(message->payload), message->payloadlen);
-    reportMessageReceived(topic, payload);
+    std::string payload(static_cast<const char*>(message->payload), static_cast<size_t>(message->payloadlen));
+    reportMessageReceived(topic, std::move(payload));
 }
 
 void CMosqMqttClient::Impl::on_subscribe_v5(int mid,
                                             int qos_count,
-                                            const int *granted_qos,
-                                            const mosquitto_property *props) noexcept
+                                            const int* granted_qos,
+                                            const mosquitto_property*) noexcept
 {
-    reportSubscribed(mid, (qos_count > 0) && (granted_qos != nullptr) ? granted_qos[0] : -1);
+    reportSubscribed(mid, (qos_count > 0 && granted_qos != nullptr) ? granted_qos[0] : -1);
 }
 
-void CMosqMqttClient::Impl::on_unsubscribe_v5(int mid, const mosquitto_property *props) noexcept
+void CMosqMqttClient::Impl::on_unsubscribe_v5(int mid, const mosquitto_property*) noexcept
 {
     reportUnsubscribed(mid);
 }
 
-void CMosqMqttClient::Impl::on_publish_v5(int mid,
-                                          int reason_code,
-                                          const mosquitto_property *props) noexcept
+void CMosqMqttClient::Impl::on_publish_v5(int mid, int reason_code, const mosquitto_property*) noexcept
 {
     if (reason_code == 0) {
         reportPublished(mid);
     } else {
-        reportError("发布消息失败，错误代码: " + std::to_string(reason_code));
+        reportError("mqtt publish failed, rc=" + std::to_string(reason_code));
     }
 }
 
 void CMosqMqttClient::Impl::on_error() noexcept
 {
-    reportError("发生未知错误");
+    reportError("mqtt internal error");
 }
 
-void CMosqMqttClient::Impl::on_log(int level, const char *str) noexcept
+void CMosqMqttClient::Impl::on_log(int level, const char* str) noexcept
 {
-    (void) level;
-    (void) str;
+    (void)level;
+    (void)str;
 }
 
 } // namespace mosq

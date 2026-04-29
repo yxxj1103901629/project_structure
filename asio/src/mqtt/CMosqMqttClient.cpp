@@ -1,14 +1,14 @@
 #include "mqtt/CMosqMqttClient.h"
 #include "CMosqMqttClientImpl.h"
 #include "utils/MakeHelper.h"
-#include <cassert>
 
 namespace mosq {
 
 CMosqMqttClient::CMosqMqttClient()
     : m_pImpl(nullptr)
 {}
-CMosqMqttClient::~CMosqMqttClient() {}
+
+CMosqMqttClient::~CMosqMqttClient() = default;
 
 bool CMosqMqttClient::init(const Config& config) noexcept
 {
@@ -31,11 +31,7 @@ bool CMosqMqttClient::init(const Config& config) noexcept
 
 bool CMosqMqttClient::connect() noexcept
 {
-    if (!m_pImpl) {
-        assert(false && "CMosqMqttClient 没有初始化");
-        return false;
-    }
-    return m_pImpl->connect();
+    return m_pImpl && m_pImpl->connect();
 }
 
 void CMosqMqttClient::disconnect() noexcept
@@ -45,13 +41,13 @@ void CMosqMqttClient::disconnect() noexcept
     }
 }
 
-bool CMosqMqttClient::publish(
-    const std::string& topic, const char* payload, size_t length, int qos, bool retain) noexcept
+bool CMosqMqttClient::publish(const std::string& topic,
+                              const char* payload,
+                              size_t length,
+                              int qos,
+                              bool retain) noexcept
 {
-    if (!m_pImpl) {
-        return false;
-    }
-    return m_pImpl->publish(topic, payload, length, qos, retain);
+    return m_pImpl && m_pImpl->publish(topic, payload, length, qos, retain);
 }
 
 bool CMosqMqttClient::publish(const std::string& topic,
@@ -72,18 +68,12 @@ bool CMosqMqttClient::publish(const std::string& topic,
 
 bool CMosqMqttClient::subscribe(const std::string& topic, int qos) noexcept
 {
-    if (!m_pImpl) {
-        return false;
-    }
-    return m_pImpl->subscribe(topic, qos);
+    return m_pImpl && m_pImpl->subscribe(topic, qos);
 }
 
 bool CMosqMqttClient::unsubscribe(const std::string& topic) noexcept
 {
-    if (!m_pImpl) {
-        return false;
-    }
-    return m_pImpl->unsubscribe(topic);
+    return m_pImpl && m_pImpl->unsubscribe(topic);
 }
 
 void CMosqMqttClient::setCallback(const ClientCallback& callback) noexcept

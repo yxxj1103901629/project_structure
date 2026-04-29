@@ -1,16 +1,16 @@
 cmake_minimum_required(VERSION 3.16)
 project(network_tests)
 
-# ==================== 基础配置 ====================
+# ==================== Basic Configuration ====================
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# ==================== 路径配置 ====================
+# ==================== Paths ====================
 set(BIN_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../bin)
 set(NETWORK_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 set(NETWORK_LIB_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../bin/$<IF:$<CONFIG:Debug>,debug,release>)
 
-# ==================== 测试目标配置函数 ====================
+# ==================== Test Helper ====================
 function(add_network_test target_name source_file)
     add_executable(${target_name} ${source_file})
 
@@ -26,7 +26,7 @@ function(add_network_test target_name source_file)
     add_test(NAME ${target_name} COMMAND ${target_name})
 endfunction()
 
-# ==================== 测试目标 ====================
+# ==================== Tests ====================
 add_network_test(${PROJECT_NAME} test_tcp_server.cpp)
 add_network_test(network_client_tests test_tcp_client.cpp)
 add_network_test(mqtt_client_tests test_mqtt_client.cpp)
